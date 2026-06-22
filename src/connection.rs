@@ -518,14 +518,6 @@ pub(crate) enum PendingReceive {
 }
 
 impl PendingReceive {
-    fn max_len(&self) -> usize {
-        match self {
-            Self::Raw { max_len, .. } | Self::Rtp { max_len, .. } | Self::Frame { max_len, .. } => {
-                *max_len
-            }
-        }
-    }
-
     fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Raw { .. } | Self::Rtp { .. } => None,
@@ -572,6 +564,94 @@ impl PendingReceive {
     }
 }
 
+type VoiceFrameReceiveResult = VoiceResult<VoiceReceivedFrame>;
+
+#[derive(Default)]
+pub(crate) struct ReadyVoiceFrameQueue {
+    frames: VecDeque<VoiceFrameReceiveResult>,
+}
+
+impl ReadyVoiceFrameQueue {
+    pub(crate) fn pop_front(&mut self) -> Option<VoiceFrameReceiveResult> {
+        self.frames.pop_front()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn push<O>(&mut self, observer: &O, result: VoiceFrameReceiveResult)
+    where
+        O: VoiceConnectionObserver,
+    {
+        if self.frames.len() >= VOICE_READY_FRAME_BUFFER_MAX
+            && let Some(dropped) = self.frames.pop_front()
+        {
+            Self::observe_dropped(observer, &dropped, self.frames.len());
+        }
+        self.frames.push_back(result);
+    }
+
+    fn observe_dropped<O>(observer: &O, result: &VoiceFrameReceiveResult, queued_frames: usize)
+    where
+        O: VoiceConnectionObserver,
+    {
+        if !O::ENABLE_RECEIVE_TELEMETRY {
+            return;
+        }
+        let (ssrc, user_id, seq, dropped_error) = match result {
+            Ok(frame) => (
+                Some(frame.rtp.ssrc),
+                frame.user_id,
+                Some(frame.rtp.seq),
+                false,
+            ),
+            Err(_) => (None, None, None, true),
+        };
+        observer.receive_frame_dropped(VoiceReceiveFrameDroppedEvent {
+            reason: VoiceReceiveFrameDropReason::ReadyQueueOverflow,
+            ssrc,
+            user_id,
+            seq,
+            queued_frames,
+            dropped_error,
+        });
+    }
+}
+
+pub(crate) fn limit_raw_packet_result(
+    raw: VoiceRawUdpPacket,
+    max_len: usize,
+    kind: VoicePayloadKind,
+) -> VoiceResult<VoiceRawUdpPacket> {
+    if raw.bytes.len() > max_len {
+        Err(VoiceError::PayloadTooLarge {
+            kind,
+            len: raw.bytes.len(),
+            max_len,
+        })
+    } else {
+        Ok(raw)
+    }
+}
+
+pub(crate) fn limit_voice_frame_result(
+    result: VoiceFrameReceiveResult,
+    max_len: usize,
+) -> VoiceFrameReceiveResult {
+    result.and_then(|frame| {
+        if frame.frame.len() > max_len {
+            Err(VoiceError::PayloadTooLarge {
+                kind: VoicePayloadKind::VoiceFrame,
+                len: frame.frame.len(),
+                max_len,
+            })
+        } else {
+            Ok(frame)
+        }
+    })
+}
+
 pub(crate) struct VoiceConnectionDriver<O: VoiceConnectionObserver> {
     write: VoiceWebSocketWrite,
     read: VoiceWebSocketRead,
@@ -584,7 +664,7 @@ pub(crate) struct VoiceConnectionDriver<O: VoiceConnectionObserver> {
     dave: VoiceDaveCoordinator,
     receive: VoiceReceiveState,
     receive_buffer: Vec<u8>,
-    ready_voice_frames: VecDeque<VoiceReceivedFrame>,
+    ready_voice_frames: ReadyVoiceFrameQueue,
     pending_receives: VecDeque<PendingReceive>,
     pending_sends: VecDeque<PendingSendOpusFrame>,
     pending_media_ready_waits: VecDeque<PendingMediaReadyWait>,
@@ -624,18 +704,12 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
 
         loop {
             self.discard_inactive_pending_receives();
-            self.resolve_pending_receives()?;
+            self.resolve_pending_receives();
             self.discard_inactive_pending_receives();
             self.resolve_pending_media_ready_waits();
             self.resolve_pending_sends().await?;
 
-            self.receive_buffer.resize(
-                self.pending_receives
-                    .front()
-                    .map(PendingReceive::max_len)
-                    .unwrap_or(VOICE_UDP_PACKET_MAX_BYTES),
-                0,
-            );
+            self.receive_buffer.resize(VOICE_UDP_PACKET_MAX_BYTES, 0);
             let wake_deadline = self.next_driver_wake_deadline();
 
             tokio::select! {
@@ -684,7 +758,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                             elapsed: started.elapsed(),
                         });
                     }
-                    self.handle_received_udp_packet(VoiceRawUdpPacket::from_bytes(bytes))?;
+                    self.handle_received_udp_packet(VoiceRawUdpPacket::from_bytes(bytes));
                 }
                 () = async {
                     if let Some(deadline) = wake_deadline {
@@ -697,7 +771,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                     }
                     self.pump_dave().await?;
                     self.resolve_pending_media_ready_waits();
-                    self.resolve_pending_receives()?;
+                    self.resolve_pending_receives();
                 }
             }
         }
@@ -747,7 +821,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                     max_wait: None,
                     response,
                 });
-                self.resolve_pending_receives()?;
+                self.resolve_pending_receives();
             }
             VoiceConnectionCommand::RecvVoiceFrameTimeout {
                 max_len,
@@ -760,7 +834,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                     max_wait: Some(max_wait),
                     response,
                 });
-                self.resolve_pending_receives()?;
+                self.resolve_pending_receives();
             }
             VoiceConnectionCommand::DaveMediaStatus { response } => {
                 let _ = response.send(self.current_dave_media_status());
@@ -980,44 +1054,45 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
         Ok(packet.metadata)
     }
 
-    fn resolve_pending_receives(&mut self) -> VoiceResult<()> {
-        while matches!(
-            self.pending_receives.front(),
-            Some(PendingReceive::Frame { .. })
-        ) {
-            let packet = match self.ready_voice_frames.pop_front() {
-                Some(packet) => packet,
+    fn resolve_pending_receives(&mut self) {
+        loop {
+            let Some(index) = self
+                .pending_receives
+                .iter()
+                .position(|receive| matches!(receive, PendingReceive::Frame { .. }))
+            else {
+                return;
+            };
+            let result = match self.ready_voice_frames.pop_front() {
+                Some(result) => result,
                 None => {
-                    let Some(packet) = self.drain_ready_voice_frame()? else {
-                        return Ok(());
+                    let Some(result) = self.drain_ready_voice_frame() else {
+                        return;
                     };
-                    packet
+                    result
                 }
             };
-            let Some(PendingReceive::Frame { response, .. }) = self.pending_receives.pop_front()
+            let Some(PendingReceive::Frame {
+                max_len, response, ..
+            }) = self.pending_receives.remove(index)
             else {
-                unreachable!("front checked");
+                unreachable!("position checked");
             };
-            let _ = response.send(Ok(packet));
+            let _ = response.send(limit_voice_frame_result(result, max_len));
         }
-        Ok(())
     }
 
-    fn queue_ready_voice_frame(&mut self, packet: VoiceReceivedFrame) {
-        if self.ready_voice_frames.len() >= VOICE_READY_FRAME_BUFFER_MAX {
-            self.ready_voice_frames.pop_front();
-        }
-        self.ready_voice_frames.push_back(packet);
+    fn queue_ready_voice_frame(&mut self, result: VoiceFrameReceiveResult) {
+        self.ready_voice_frames.push(&self.observer, result);
     }
 
-    fn collect_ready_voice_frames(&mut self) -> VoiceResult<()> {
+    fn collect_ready_voice_frames(&mut self) {
         while self.ready_voice_frames.len() < VOICE_READY_FRAME_BUFFER_MAX {
-            let Some(packet) = self.drain_ready_voice_frame()? else {
-                return Ok(());
+            let Some(result) = self.drain_ready_voice_frame() else {
+                return;
             };
-            self.queue_ready_voice_frame(packet);
+            self.queue_ready_voice_frame(result);
         }
-        Ok(())
     }
 
     fn discard_inactive_pending_receives(&mut self) {
@@ -1036,105 +1111,93 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
         self.pending_receives = retained;
     }
 
-    fn handle_received_udp_packet(&mut self, raw: VoiceRawUdpPacket) -> VoiceResult<()> {
-        let request = loop {
-            let Some(request) = self.pending_receives.pop_front() else {
-                return self.buffer_received_udp_packet(raw);
-            };
-            if request.is_closed() {
-                continue;
-            }
-            if request.is_expired(Instant::now()) {
-                request.complete_timeout();
-                continue;
-            }
-            break request;
-        };
-        match request {
-            PendingReceive::Raw { response, .. } => {
-                let _ = response.send(Ok(raw));
-            }
-            PendingReceive::Rtp { max_len, response } => {
-                if raw.is_rtcp() {
-                    self.observe_rtcp_packet(&raw);
-                    self.pending_receives
-                        .push_front(PendingReceive::Rtp { max_len, response });
-                } else {
-                    let _ = response.send(Ok(raw));
-                }
-            }
-            PendingReceive::Frame {
-                max_len,
-                deadline,
-                max_wait,
-                response,
-            } => {
-                if raw.is_rtcp() {
-                    self.observe_rtcp_packet(&raw);
-                    self.pending_receives.push_front(PendingReceive::Frame {
-                        max_len,
-                        deadline,
-                        max_wait,
-                        response,
-                    });
-                    return Ok(());
-                }
-                match self.decode_received_voice_packet(raw) {
-                    Ok(Some(packet)) => {
-                        let _ = response.send(Ok(packet));
-                    }
-                    Ok(None) => {
-                        self.pending_receives.push_front(PendingReceive::Frame {
-                            max_len,
-                            deadline,
-                            max_wait,
-                            response,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = response.send(Err(error));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn buffer_received_udp_packet(&mut self, raw: VoiceRawUdpPacket) -> VoiceResult<()> {
+    fn handle_received_udp_packet(&mut self, raw: VoiceRawUdpPacket) {
+        self.resolve_pending_low_level_receives(&raw);
         if raw.is_rtcp() {
             self.observe_rtcp_packet(&raw);
-            return Ok(());
+            return;
         }
-        if let Ok(Some(packet)) = self.decode_received_voice_packet(raw) {
-            self.queue_ready_voice_frame(packet);
+        if let Some(result) = self.decode_received_voice_packet(raw) {
+            self.queue_ready_voice_frame(result);
         }
-        self.collect_ready_voice_frames()
+        self.collect_ready_voice_frames();
+        self.resolve_pending_receives();
+    }
+
+    fn resolve_pending_low_level_receives(&mut self, raw: &VoiceRawUdpPacket) {
+        self.resolve_pending_raw_udp_receive(raw);
+        if !raw.is_rtcp() {
+            self.resolve_pending_rtp_udp_receive(raw);
+        }
+    }
+
+    fn resolve_pending_raw_udp_receive(&mut self, raw: &VoiceRawUdpPacket) {
+        let Some(index) = self
+            .pending_receives
+            .iter()
+            .position(|receive| matches!(receive, PendingReceive::Raw { .. }))
+        else {
+            return;
+        };
+        let Some(PendingReceive::Raw { max_len, response }) = self.pending_receives.remove(index)
+        else {
+            unreachable!("position checked");
+        };
+        let _ = response.send(limit_raw_packet_result(
+            raw.clone(),
+            max_len,
+            VoicePayloadKind::RawUdpPacket,
+        ));
+    }
+
+    fn resolve_pending_rtp_udp_receive(&mut self, raw: &VoiceRawUdpPacket) {
+        let Some(index) = self
+            .pending_receives
+            .iter()
+            .position(|receive| matches!(receive, PendingReceive::Rtp { .. }))
+        else {
+            return;
+        };
+        let Some(PendingReceive::Rtp { max_len, response }) = self.pending_receives.remove(index)
+        else {
+            unreachable!("position checked");
+        };
+        let _ = response.send(limit_raw_packet_result(
+            raw.clone(),
+            max_len,
+            VoicePayloadKind::RtpPacket,
+        ));
     }
 
     fn decode_received_voice_packet(
         &mut self,
         raw: VoiceRawUdpPacket,
-    ) -> VoiceResult<Option<VoiceReceivedFrame>> {
+    ) -> Option<VoiceFrameReceiveResult> {
         let rtp = match parse_rtp_header(&raw.bytes) {
             Ok(rtp) => rtp,
             Err(error) => {
+                let detail = error.to_string();
                 self.observe_decode_error(
                     VoiceReceiveDecodeStage::Rtp,
                     VoiceReceiveDecodeErrorKind::MalformedRtp,
                     raw.ssrc,
                     None,
                     raw.seq,
-                    error.to_string(),
+                    detail,
                 );
-                return Err(error.into());
+                return Some(Err(error.into()));
             }
         };
         let (encrypted_frame, user_id, dave_active) = {
             let state = self.state.internal();
-            let session_description = state
-                .session_description
-                .as_ref()
-                .ok_or_else(|| VoiceError::protocol("missing voice session description"))?;
+            let session_description = match state.session_description.as_ref() {
+                Some(session_description) => session_description,
+                None => {
+                    return Some(Err(VoiceError::protocol(
+                        "missing voice session description",
+                    )));
+                }
+            };
             let user_id = state.ssrc_users.get(&rtp.ssrc).copied();
             let encrypted_frame = match decrypt_transport_payload(
                 &raw.bytes,
@@ -1154,7 +1217,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                         Some(rtp.seq),
                         detail,
                     );
-                    return Err(error);
+                    return Some(Err(error));
                 }
             };
             (
@@ -1173,32 +1236,30 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
             reason: VoiceDavePendingMediaReason::DecryptStatePending,
             was_pending: false,
         };
-        let Some(media) = self.receive.push_media_frame(&self.observer, media) else {
-            return Ok(None);
-        };
+        let media = self.receive.push_media_frame(&self.observer, media)?;
         self.decode_ordered_media_frame(media)
     }
 
-    fn drain_ready_voice_frame(&mut self) -> VoiceResult<Option<VoiceReceivedFrame>> {
-        if let Some(packet) = self.drain_pending_dave_media()? {
-            return Ok(Some(packet));
+    fn drain_ready_voice_frame(&mut self) -> Option<VoiceFrameReceiveResult> {
+        if let Some(result) = self.drain_pending_dave_media() {
+            return Some(result);
         }
         while let Some(media) = self.receive.drain_ordered_media(&self.observer) {
-            if let Some(packet) = self.decode_ordered_media_frame(media)? {
-                return Ok(Some(packet));
+            if let Some(result) = self.decode_ordered_media_frame(media) {
+                return Some(result);
             }
         }
-        Ok(None)
+        None
     }
 
     fn decode_ordered_media_frame(
         &mut self,
         media: PendingVoiceMediaFrame,
-    ) -> VoiceResult<Option<VoiceReceivedFrame>> {
+    ) -> Option<VoiceFrameReceiveResult> {
         if media.dave {
             return self.decode_or_enqueue_dave_media(media);
         }
-        Ok(Some(VoiceReceivedFrame {
+        Some(Ok(VoiceReceivedFrame {
             raw: media.raw,
             rtp: media.rtp,
             user_id: media.user_id,
@@ -1208,11 +1269,9 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
         }))
     }
 
-    fn drain_pending_dave_media(&mut self) -> VoiceResult<Option<VoiceReceivedFrame>> {
+    fn drain_pending_dave_media(&mut self) -> Option<VoiceFrameReceiveResult> {
         for _ in 0..self.receive.pending_dave_media.len() {
-            let Some(mut media) = self.receive.pending_dave_media.pop_front() else {
-                return Ok(None);
-            };
+            let mut media = self.receive.pending_dave_media.pop_front()?;
             media.was_pending = true;
             if media.enqueued_at.elapsed() >= DAVE_PENDING_MEDIA_TTL {
                 self.observe_pending_dave_media(
@@ -1222,17 +1281,17 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                 );
                 continue;
             }
-            if let Some(decoded) = self.decode_or_enqueue_dave_media(media)? {
-                return Ok(Some(decoded));
+            if let Some(result) = self.decode_or_enqueue_dave_media(media) {
+                return Some(result);
             }
         }
-        Ok(None)
+        None
     }
 
     fn decode_or_enqueue_dave_media(
         &mut self,
         mut media: PendingVoiceMediaFrame,
-    ) -> VoiceResult<Option<VoiceReceivedFrame>> {
+    ) -> Option<VoiceFrameReceiveResult> {
         media.user_id = self
             .state
             .internal()
@@ -1241,7 +1300,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
             .copied();
         if media.user_id.is_none() {
             self.enqueue_dave_media(media, VoiceDavePendingMediaReason::MissingUser);
-            return Ok(None);
+            return None;
         }
         let (gateway_pending, transition_zero_ready) = {
             let state = self.state.internal();
@@ -1252,11 +1311,11 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
         };
         if !self.dave.ready() {
             self.enqueue_dave_media(media, VoiceDavePendingMediaReason::SessionNotReady);
-            return Ok(None);
+            return None;
         }
         if gateway_pending && !transition_zero_ready {
             self.enqueue_dave_media(media, VoiceDavePendingMediaReason::GatewayPending);
-            return Ok(None);
+            return None;
         }
         match self
             .dave
@@ -1267,7 +1326,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                 if media.was_pending {
                     self.observe_pending_dave_media(&media, media.reason, true);
                 }
-                Ok(Some(VoiceReceivedFrame {
+                Some(Ok(VoiceReceivedFrame {
                     raw: media.raw,
                     rtp: media.rtp,
                     user_id: media.user_id,
@@ -1298,14 +1357,14 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                         VoiceDavePendingMediaReason::DecryptStatePending
                     };
                     self.enqueue_dave_media(media, reason);
-                    return Ok(None);
+                    return None;
                 }
                 self.observe_pending_dave_media(
                     &media,
                     VoiceDavePendingMediaReason::StableDecryptFailure,
                     false,
                 );
-                Ok(None)
+                Some(Err(VoiceDaveError::Decrypt(error).into()))
             }
         }
     }
@@ -1645,7 +1704,7 @@ where
             dave: VoiceDaveCoordinator::new(voice_user_id, voice_channel_id)?,
             receive: VoiceReceiveState::default(),
             receive_buffer: Vec::new(),
-            ready_voice_frames: VecDeque::new(),
+            ready_voice_frames: ReadyVoiceFrameQueue::default(),
             pending_receives: VecDeque::new(),
             pending_sends: VecDeque::new(),
             pending_media_ready_waits: VecDeque::new(),

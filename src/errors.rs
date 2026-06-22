@@ -15,6 +15,11 @@ pub enum VoiceError {
     Dave(VoiceDaveError),
     Rtp(VoiceRtpError),
     TransportCrypto(VoiceTransportCryptoError),
+    PayloadTooLarge {
+        kind: VoicePayloadKind,
+        len: usize,
+        max_len: usize,
+    },
     Backpressure(String),
     Closed,
     Join(String),
@@ -53,6 +58,12 @@ impl fmt::Display for VoiceError {
             Self::Dave(error) => write!(f, "{error}"),
             Self::Rtp(error) => write!(f, "{error}"),
             Self::TransportCrypto(error) => write!(f, "{error}"),
+            Self::PayloadTooLarge { kind, len, max_len } => {
+                write!(
+                    f,
+                    "voice {kind} is {len} bytes, exceeding requested max_len {max_len}"
+                )
+            }
             Self::Backpressure(message) => f.write_str(message),
             Self::Closed => f.write_str("voice connection is closed"),
             Self::Join(message) => f.write_str(message),
@@ -111,6 +122,23 @@ impl From<VoiceTransportCryptoError> for VoiceError {
 }
 
 pub type VoiceResult<T> = Result<T, VoiceError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoicePayloadKind {
+    RawUdpPacket,
+    RtpPacket,
+    VoiceFrame,
+}
+
+impl fmt::Display for VoicePayloadKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RawUdpPacket => f.write_str("raw UDP packet"),
+            Self::RtpPacket => f.write_str("RTP packet"),
+            Self::VoiceFrame => f.write_str("voice frame"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VoiceRtpError {

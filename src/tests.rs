@@ -248,6 +248,68 @@ fn receive_rtp_reports_loss_only_after_reorder_window_expires() {
 }
 
 #[test]
+fn ready_voice_frame_queue_reports_overflow() {
+    let observer = TestReceiveObserver::default();
+    let mut queue = ReadyVoiceFrameQueue::default();
+
+    for seq in 0..=VOICE_READY_FRAME_BUFFER_MAX {
+        queue.push(
+            &observer,
+            Ok(test_received_frame_with_seq(seq as u16, vec![0xde])),
+        );
+    }
+
+    assert_eq!(queue.len(), VOICE_READY_FRAME_BUFFER_MAX);
+    assert_eq!(observer.frame_drop_count(), 1);
+    assert_eq!(observer.frame_drop_seq(), Some(0));
+    assert_eq!(
+        observer.frame_drop_queued_frames(),
+        VOICE_READY_FRAME_BUFFER_MAX - 1
+    );
+    assert!(!observer.frame_drop_was_error());
+}
+
+#[test]
+fn ready_voice_frame_queue_preserves_decode_errors() {
+    let observer = TestReceiveObserver::default();
+    let mut queue = ReadyVoiceFrameQueue::default();
+
+    queue.push(
+        &observer,
+        Err(VoiceRtpError::PacketTooShort { len: 1 }.into()),
+    );
+
+    assert!(matches!(
+        queue.pop_front(),
+        Some(Err(VoiceError::Rtp(VoiceRtpError::PacketTooShort {
+            len: 1
+        })))
+    ));
+}
+
+#[test]
+fn receive_max_len_is_applied_after_packet_capture() {
+    let raw = VoiceRawUdpPacket::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]);
+
+    assert!(matches!(
+        limit_raw_packet_result(raw, 3, VoicePayloadKind::RawUdpPacket),
+        Err(VoiceError::PayloadTooLarge {
+            kind: VoicePayloadKind::RawUdpPacket,
+            len: 4,
+            max_len: 3,
+        })
+    ));
+    assert!(matches!(
+        limit_voice_frame_result(Ok(test_received_frame(vec![0xde, 0xad])), 1),
+        Err(VoiceError::PayloadTooLarge {
+            kind: VoicePayloadKind::VoiceFrame,
+            len: 2,
+            max_len: 1,
+        })
+    ));
+}
+
+#[test]
 fn missing_dave_user_is_typed_error() {
     let mut session = VoiceDaveySession::discord_default(1, 2).unwrap();
     assert_eq!(
@@ -637,6 +699,10 @@ struct TestReceiveObserver {
     first_seq: Arc<std::sync::atomic::AtomicUsize>,
     last_seq: Arc<std::sync::atomic::AtomicUsize>,
     missing_packets: Arc<std::sync::atomic::AtomicUsize>,
+    frame_drop_count: Arc<std::sync::atomic::AtomicUsize>,
+    frame_drop_seq: Arc<std::sync::atomic::AtomicUsize>,
+    frame_drop_queued_frames: Arc<std::sync::atomic::AtomicUsize>,
+    frame_drop_was_error: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TestReceiveObserver {
@@ -655,6 +721,28 @@ impl TestReceiveObserver {
     fn missing_packets(&self) -> u16 {
         self.missing_packets
             .load(std::sync::atomic::Ordering::Relaxed) as u16
+    }
+
+    fn frame_drop_count(&self) -> usize {
+        self.frame_drop_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn frame_drop_seq(&self) -> Option<u16> {
+        let seq = self
+            .frame_drop_seq
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (seq != usize::MAX).then_some(seq as u16)
+    }
+
+    fn frame_drop_queued_frames(&self) -> usize {
+        self.frame_drop_queued_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn frame_drop_was_error(&self) -> bool {
+        self.frame_drop_was_error
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -676,6 +764,19 @@ impl VoiceConnectionObserver for TestReceiveObserver {
             usize::from(event.missing_packets),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    fn receive_frame_dropped(&self, event: VoiceReceiveFrameDroppedEvent) {
+        self.frame_drop_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.frame_drop_seq.store(
+            event.seq.map_or(usize::MAX, usize::from),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.frame_drop_queued_frames
+            .store(event.queued_frames, std::sync::atomic::Ordering::Relaxed);
+        self.frame_drop_was_error
+            .store(event.dropped_error, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -704,6 +805,10 @@ fn test_pending_media(ssrc: u32, seq: u16) -> PendingVoiceMediaFrame {
 }
 
 fn test_received_frame(frame: Vec<u8>) -> VoiceReceivedFrame {
+    test_received_frame_with_seq(0, frame)
+}
+
+fn test_received_frame_with_seq(seq: u16, frame: Vec<u8>) -> VoiceReceivedFrame {
     VoiceReceivedFrame {
         raw: VoiceRawUdpPacket::from_bytes(Vec::new()),
         rtp: VoiceRtpHeader {
@@ -712,7 +817,7 @@ fn test_received_frame(frame: Vec<u8>) -> VoiceReceivedFrame {
             extension: false,
             marker: false,
             payload_type: RTP_PAYLOAD_TYPE_OPUS,
-            seq: 0,
+            seq,
             timestamp: 0,
             ssrc: 0,
             header_len: 12,

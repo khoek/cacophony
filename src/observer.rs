@@ -54,6 +54,8 @@ pub trait VoiceConnectionObserver: Clone + Send + Sync + 'static {
 
     fn receive_decode_error(&self, _event: VoiceReceiveDecodeErrorEvent) {}
 
+    fn receive_frame_dropped(&self, _event: VoiceReceiveFrameDroppedEvent) {}
+
     fn dave_pending_media_enqueued(&self, _event: VoiceDavePendingMediaEvent) {}
 
     fn dave_pending_media_drained(&self, _event: VoiceDavePendingMediaEvent) {}
@@ -271,6 +273,22 @@ pub struct VoiceReceiveDecodeErrorEvent {
     pub user_id: Option<u64>,
     pub seq: Option<u16>,
     pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceReceiveFrameDropReason {
+    ReadyQueueOverflow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct VoiceReceiveFrameDroppedEvent {
+    pub reason: VoiceReceiveFrameDropReason,
+    pub ssrc: Option<u32>,
+    pub user_id: Option<u64>,
+    pub seq: Option<u16>,
+    pub queued_frames: usize,
+    pub dropped_error: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
