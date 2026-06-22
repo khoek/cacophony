@@ -584,6 +584,7 @@ pub(crate) struct VoiceConnectionDriver<O: VoiceConnectionObserver> {
     dave: VoiceDaveCoordinator,
     receive: VoiceReceiveState,
     receive_buffer: Vec<u8>,
+    ready_voice_frames: VecDeque<VoiceReceivedFrame>,
     pending_receives: VecDeque<PendingReceive>,
     pending_sends: VecDeque<PendingSendOpusFrame>,
     pending_media_ready_waits: VecDeque<PendingMediaReadyWait>,
@@ -628,11 +629,13 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
             self.resolve_pending_media_ready_waits();
             self.resolve_pending_sends().await?;
 
-            let pending_receive_max_len =
-                self.pending_receives.front().map(PendingReceive::max_len);
-            if let Some(max_len) = pending_receive_max_len {
-                self.receive_buffer.resize(max_len, 0);
-            }
+            self.receive_buffer.resize(
+                self.pending_receives
+                    .front()
+                    .map(PendingReceive::max_len)
+                    .unwrap_or(VOICE_UDP_PACKET_MAX_BYTES),
+                0,
+            );
             let wake_deadline = self.next_driver_wake_deadline();
 
             tokio::select! {
@@ -667,7 +670,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
                     let _ = self.write.send(WsMessage::Close(None)).await;
                     break;
                 }
-                received = self.udp_socket.recv(&mut self.receive_buffer), if pending_receive_max_len.is_some() => {
+                received = self.udp_socket.recv(&mut self.receive_buffer) => {
                     let started = O::ENABLE_TIMING.then(Instant::now);
                     let received = received?;
                     let bytes = self.receive_buffer[..received].to_vec();
@@ -982,14 +985,37 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
             self.pending_receives.front(),
             Some(PendingReceive::Frame { .. })
         ) {
-            let Some(packet) = self.drain_ready_voice_frame()? else {
-                return Ok(());
+            let packet = match self.ready_voice_frames.pop_front() {
+                Some(packet) => packet,
+                None => {
+                    let Some(packet) = self.drain_ready_voice_frame()? else {
+                        return Ok(());
+                    };
+                    packet
+                }
             };
             let Some(PendingReceive::Frame { response, .. }) = self.pending_receives.pop_front()
             else {
                 unreachable!("front checked");
             };
             let _ = response.send(Ok(packet));
+        }
+        Ok(())
+    }
+
+    fn queue_ready_voice_frame(&mut self, packet: VoiceReceivedFrame) {
+        if self.ready_voice_frames.len() >= VOICE_READY_FRAME_BUFFER_MAX {
+            self.ready_voice_frames.pop_front();
+        }
+        self.ready_voice_frames.push_back(packet);
+    }
+
+    fn collect_ready_voice_frames(&mut self) -> VoiceResult<()> {
+        while self.ready_voice_frames.len() < VOICE_READY_FRAME_BUFFER_MAX {
+            let Some(packet) = self.drain_ready_voice_frame()? else {
+                return Ok(());
+            };
+            self.queue_ready_voice_frame(packet);
         }
         Ok(())
     }
@@ -1013,7 +1039,7 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
     fn handle_received_udp_packet(&mut self, raw: VoiceRawUdpPacket) -> VoiceResult<()> {
         let request = loop {
             let Some(request) = self.pending_receives.pop_front() else {
-                return Ok(());
+                return self.buffer_received_udp_packet(raw);
             };
             if request.is_closed() {
                 continue;
@@ -1072,6 +1098,17 @@ impl<O: VoiceConnectionObserver> VoiceConnectionDriver<O> {
             }
         }
         Ok(())
+    }
+
+    fn buffer_received_udp_packet(&mut self, raw: VoiceRawUdpPacket) -> VoiceResult<()> {
+        if raw.is_rtcp() {
+            self.observe_rtcp_packet(&raw);
+            return Ok(());
+        }
+        if let Ok(Some(packet)) = self.decode_received_voice_packet(raw) {
+            self.queue_ready_voice_frame(packet);
+        }
+        self.collect_ready_voice_frames()
     }
 
     fn decode_received_voice_packet(
@@ -1608,6 +1645,7 @@ where
             dave: VoiceDaveCoordinator::new(voice_user_id, voice_channel_id)?,
             receive: VoiceReceiveState::default(),
             receive_buffer: Vec::new(),
+            ready_voice_frames: VecDeque::new(),
             pending_receives: VecDeque::new(),
             pending_sends: VecDeque::new(),
             pending_media_ready_waits: VecDeque::new(),

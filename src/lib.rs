@@ -71,6 +71,8 @@ const DAVE_PENDING_MEDIA_TTL: Duration = Duration::from_secs(10);
 const RECEIVE_INTERARRIVAL_WINDOW: usize = 256;
 const RTP_REORDER_TTL: Duration = Duration::from_millis(60);
 const RTP_REORDER_BUFFER_MAX_FRAMES: usize = 32;
+const VOICE_UDP_PACKET_MAX_BYTES: usize = 4096;
+const VOICE_READY_FRAME_BUFFER_MAX: usize = 4096;
 
 type VoiceWebSocketStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type VoiceWebSocketConnectResult = (VoiceWebSocketStream, WebSocketResponse);
