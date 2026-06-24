@@ -4,7 +4,6 @@ mod playout;
 mod receive;
 mod send;
 
-pub use driver::{connect, connect_with_observer, connect_with_observer_and_raw};
 pub use handle::{Connection, FrameStream};
 pub(crate) use handle::{
     ConnectionClose, ConnectionCommand, ConnectionInner, ConnectionStateStore,

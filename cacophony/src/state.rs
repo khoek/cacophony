@@ -9,7 +9,7 @@ use dave::DAVE_PROTOCOL_VERSION;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     errors::{Error, InvalidInputError, Result},
@@ -95,12 +95,36 @@ impl ConnectionTuning {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionConfig {
-    pub server_id: u64,
+    pub guild_id: u64,
     pub channel_id: u64,
     pub user_id: u64,
-    pub session_id: SessionId,
-    pub token: Token,
+    pub session_id: String,
+    pub token: String,
     pub endpoint: String,
+}
+
+impl Drop for ConnectionConfig {
+    fn drop(&mut self) {
+        self.session_id.zeroize();
+        self.token.zeroize();
+    }
+}
+
+impl fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("guild_id", &self.guild_id)
+            .field("channel_id", &self.channel_id)
+            .field("user_id", &self.user_id)
+            .field("session_id", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionOptions {
     pub gateway_version: u8,
     pub preferred_mode: Option<EncryptionMode>,
     pub max_dave_protocol_version: Option<u16>,
@@ -108,29 +132,20 @@ pub struct ConnectionConfig {
     pub tuning: ConnectionTuning,
 }
 
-impl fmt::Debug for ConnectionConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionConfig")
-            .field("server_id", &self.server_id)
-            .field("channel_id", &self.channel_id)
-            .field("user_id", &self.user_id)
-            .field("session_id", &"<redacted>")
-            .field("token", &"<redacted>")
-            .field("endpoint", &self.endpoint)
-            .field("gateway_version", &self.gateway_version)
-            .field("preferred_mode", &self.preferred_mode)
-            .field("max_dave_protocol_version", &self.max_dave_protocol_version)
-            .field(
-                "dave_send_media_ready_timeout",
-                &self.dave_send_media_ready_timeout,
-            )
-            .field("tuning", &self.tuning)
-            .finish()
+impl Default for ConnectionOptions {
+    fn default() -> Self {
+        Self {
+            gateway_version: 8,
+            preferred_mode: Some(EncryptionMode::aead_aes256_gcm_rtpsize()),
+            max_dave_protocol_version: Some(DAVE_PROTOCOL_VERSION.get()),
+            dave_send_media_ready_timeout: crate::DAVE_SEND_MEDIA_READY_TIMEOUT,
+            tuning: ConnectionTuning::default(),
+        }
     }
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct SessionId(Zeroizing<String>);
+pub(crate) struct SessionId(Zeroizing<String>);
 
 impl SessionId {
     pub fn new(value: impl Into<String>) -> Self {
@@ -149,7 +164,7 @@ impl fmt::Debug for SessionId {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token(Zeroizing<String>);
+pub(crate) struct Token(Zeroizing<String>);
 
 impl Token {
     pub fn new(value: impl Into<String>) -> Self {
@@ -168,64 +183,149 @@ impl fmt::Debug for Token {
 }
 
 impl ConnectionConfig {
-    pub fn new(
-        server_id: u64,
-        channel_id: u64,
-        user_id: u64,
-        session_id: impl Into<String>,
-        token: impl Into<String>,
-        endpoint: impl Into<String>,
-    ) -> Self {
-        Self {
-            server_id,
-            channel_id,
-            user_id,
-            session_id: SessionId::new(session_id),
-            token: Token::new(token),
-            endpoint: endpoint.into(),
-            gateway_version: 8,
-            preferred_mode: Some(EncryptionMode::aead_aes256_gcm_rtpsize()),
-            max_dave_protocol_version: Some(DAVE_PROTOCOL_VERSION.get()),
-            dave_send_media_ready_timeout: crate::DAVE_SEND_MEDIA_READY_TIMEOUT,
-            tuning: ConnectionTuning::default(),
+    pub fn with_options(self, options: ConnectionOptions) -> ConnectionRequest {
+        ConnectionRequest {
+            config: self,
+            options,
         }
     }
 
+    pub fn validate(self) -> Result<ValidatedConnectionConfig> {
+        self.with_options(ConnectionOptions::default()).validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionRequest {
+    pub config: ConnectionConfig,
+    pub options: ConnectionOptions,
+}
+
+impl ConnectionRequest {
+    pub fn validate(mut self) -> Result<ValidatedConnectionConfig> {
+        self.options.tuning.validate()?;
+        if self.options.gateway_version < 4 {
+            return Err(Error::InvalidInput(
+                InvalidInputError::UnsupportedGatewayVersion {
+                    version: self.options.gateway_version,
+                },
+            ));
+        }
+
+        let session_id = std::mem::take(&mut self.config.session_id);
+        let token = std::mem::take(&mut self.config.token);
+        let endpoint = std::mem::take(&mut self.config.endpoint);
+        let websocket_url = websocket_url(&endpoint, self.options.gateway_version);
+        Ok(ValidatedConnectionConfig {
+            identity: ConnectionIdentity {
+                guild_id: self.config.guild_id,
+                channel_id: self.config.channel_id,
+                user_id: self.config.user_id,
+            },
+            secrets: ConnectionSecrets {
+                session_id: SessionId::new(session_id),
+                token: Token::new(token),
+            },
+            endpoint,
+            websocket_url,
+            options: self.options,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionIdentity {
+    pub(crate) guild_id: u64,
+    pub(crate) channel_id: u64,
+    pub(crate) user_id: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionSecrets {
+    pub(crate) session_id: SessionId,
+    pub(crate) token: Token,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ValidatedConnectionConfig {
+    pub(crate) identity: ConnectionIdentity,
+    pub(crate) secrets: ConnectionSecrets,
+    pub(crate) endpoint: String,
+    pub(crate) websocket_url: String,
+    pub(crate) options: ConnectionOptions,
+}
+
+impl fmt::Debug for ValidatedConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedConnectionConfig")
+            .field("identity", &self.identity)
+            .field("session_id", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .field("websocket_url", &self.websocket_url)
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
+impl ValidatedConnectionConfig {
+    pub fn info(&self) -> ConnectionInfo {
+        self.runtime_config().public_info()
+    }
+
+    pub fn options(&self) -> &ConnectionOptions {
+        &self.options
+    }
+
+    pub(crate) fn runtime_config(&self) -> ConnectionRuntimeConfig {
+        ConnectionRuntimeConfig {
+            identity: self.identity,
+            endpoint: self.endpoint.clone(),
+            gateway_version: self.options.gateway_version,
+            max_dave_protocol_version: self.options.max_dave_protocol_version,
+            dave_send_media_ready_timeout: self.options.dave_send_media_ready_timeout,
+            tuning: self.options.tuning,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionRuntimeConfig {
+    pub(crate) identity: ConnectionIdentity,
+    pub(crate) endpoint: String,
+    pub(crate) gateway_version: u8,
+    pub(crate) max_dave_protocol_version: Option<u16>,
+    pub(crate) dave_send_media_ready_timeout: Duration,
+    pub(crate) tuning: ConnectionTuning,
+}
+
+impl ConnectionRuntimeConfig {
     pub(crate) fn public_info(&self) -> ConnectionInfo {
         ConnectionInfo {
-            server_id: self.server_id,
-            channel_id: self.channel_id,
-            user_id: self.user_id,
+            guild_id: self.identity.guild_id,
+            channel_id: self.identity.channel_id,
+            user_id: self.identity.user_id,
             endpoint: self.endpoint.clone(),
             gateway_version: self.gateway_version,
             max_dave_protocol_version: self.max_dave_protocol_version,
         }
     }
+}
 
-    pub(crate) fn websocket_url(&self) -> Result<String> {
-        self.tuning.validate()?;
-        if self.gateway_version < 4 {
-            return Err(Error::InvalidInput(
-                InvalidInputError::UnsupportedGatewayVersion {
-                    version: self.gateway_version,
-                },
-            ));
-        }
+fn websocket_url(endpoint: &str, gateway_version: u8) -> String {
+    let mut endpoint = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("wss://{endpoint}")
+    };
 
-        let mut endpoint = if self.endpoint.contains("://") {
-            self.endpoint.clone()
-        } else {
-            format!("wss://{}", self.endpoint)
-        };
-
-        if !endpoint.contains("?v=") {
-            let separator = if endpoint.contains('?') { "&" } else { "/?" };
-            endpoint.push_str(separator);
-            endpoint.push_str(&format!("v={}", self.gateway_version));
-        }
-
-        Ok(endpoint)
+    if !endpoint.contains("?v=") {
+        let separator = if endpoint.contains('?') { "&" } else { "/?" };
+        endpoint.push_str(separator);
+        endpoint.push_str(&format!("v={gateway_version}"));
     }
+
+    endpoint
 }
 
 impl WebSocketCloseFrame {
@@ -356,7 +456,7 @@ impl fmt::Debug for SecretKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
-    pub server_id: u64,
+    pub guild_id: u64,
     pub channel_id: u64,
     pub user_id: u64,
     pub endpoint: String,
@@ -368,7 +468,7 @@ impl ConnectionInfo {
     pub(crate) fn connection_event(&self) -> ConnectionEvent<'_> {
         ConnectionEvent {
             endpoint: &self.endpoint,
-            guild_id: self.server_id,
+            guild_id: self.guild_id,
             user_id: self.user_id,
         }
     }
@@ -529,7 +629,7 @@ pub type ConnectionStateSnapshot = Arc<ConnectionState>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionInternalState {
-    pub(crate) config: ConnectionConfig,
+    pub(crate) config: ConnectionRuntimeConfig,
     pub(crate) heartbeat_interval_ms: u64,
     pub(crate) last_seq: Option<i64>,
     pub(crate) ready: GatewayReady,

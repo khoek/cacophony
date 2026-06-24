@@ -1,7 +1,8 @@
 use std::{collections::HashSet, num::NonZeroU16, time::Duration};
 
 use dave::{
-    DAVE_PROTOCOL_VERSION, FrameCodec, FrameEncryptResult, MediaFrame, ProposalsOperation, Session,
+    FrameCodec, FrameEncryptResult, MediaFrame, ProposalsOperation, Session,
+    validate_protocol_version,
 };
 use serde::Serialize;
 
@@ -21,12 +22,15 @@ fn new_dave_session(
     user_id: u64,
     channel_id: u64,
 ) -> std::result::Result<Session, DaveError> {
-    Session::new(protocol_version, user_id, channel_id).map_err(DaveError::CreateSession)
+    validate_protocol_version(protocol_version).map_err(|_| DaveError::InvalidProtocolVersion {
+        version: protocol_version.get(),
+    })?;
+    Session::new(user_id, channel_id).map_err(DaveError::CreateSession)
 }
 
 pub(crate) struct DaveCoordinator {
     session: Session,
-    bot_user_id: u64,
+    user_id: u64,
     channel_id: u64,
     external_sender_set: bool,
     sent_key_package_for: Option<DaveKeyPackageScope>,
@@ -40,10 +44,10 @@ pub(crate) struct DaveCoordinator {
 }
 
 impl DaveCoordinator {
-    pub(crate) fn new(bot_user_id: u64, channel_id: u64) -> Result<Self> {
+    pub(crate) fn new(user_id: u64, channel_id: u64) -> Result<Self> {
         Ok(Self {
-            session: new_dave_session(DAVE_PROTOCOL_VERSION, bot_user_id, channel_id)?,
-            bot_user_id,
+            session: Session::new(user_id, channel_id).map_err(DaveError::CreateSession)?,
+            user_id,
             channel_id,
             external_sender_set: false,
             sent_key_package_for: None,
@@ -331,7 +335,7 @@ impl DaveCoordinator {
             NonZeroU16::new(protocol_version).ok_or(DaveError::InvalidProtocolVersion {
                 version: protocol_version,
             })?;
-        self.session = new_dave_session(protocol_version, self.bot_user_id, self.channel_id)?;
+        self.session = new_dave_session(protocol_version, self.user_id, self.channel_id)?;
         self.external_sender_set = false;
         Ok(())
     }

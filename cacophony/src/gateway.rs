@@ -19,7 +19,7 @@ use crate::{
     media::TransportCryptoConfig,
     media::update_state,
     observer::{ClientsConnectedEvent, ConnectionObserver},
-    state::{ConnectionConfig, DavePendingMediaRetry, EncryptionMode, SessionDescription},
+    state::{DavePendingMediaRetry, EncryptionMode, SessionDescription, ValidatedConnectionConfig},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,18 +261,18 @@ pub(crate) struct IdentifyCommand<'a> {
 }
 
 impl<'a> IdentifyCommand<'a> {
-    pub(crate) fn from_config(config: &'a ConnectionConfig) -> Self {
+    pub(crate) fn from_config(config: &'a ValidatedConnectionConfig) -> Self {
         Self {
-            server_id: config.server_id.to_string(),
-            user_id: config.user_id.to_string(),
-            session_id: config.session_id.as_str(),
-            token: config.token.as_str(),
-            max_dave_protocol_version: config.max_dave_protocol_version,
+            server_id: config.identity.guild_id.to_string(),
+            user_id: config.identity.user_id.to_string(),
+            session_id: config.secrets.session_id.as_str(),
+            token: config.secrets.token.as_str(),
+            max_dave_protocol_version: config.options.max_dave_protocol_version,
         }
     }
 }
 
-pub(crate) fn identify_payload(config: &ConnectionConfig) -> Result<String> {
+pub(crate) fn identify_payload(config: &ValidatedConnectionConfig) -> Result<String> {
     serialize_payload(Opcode::Identify, &IdentifyCommand::from_config(config))
 }
 
@@ -657,8 +657,8 @@ pub(crate) fn handle_voice_text_event(
 ) -> Result<GatewayEventEffects> {
     let state = state_store.internal();
     let endpoint = state.config.endpoint.clone();
-    let guild_id = state.config.server_id;
-    let user_id = state.config.user_id;
+    let guild_id = state.config.identity.guild_id;
+    let user_id = state.config.identity.user_id;
     let mut effects = GatewayEventEffects::default();
 
     match Opcode::from_code(event.opcode) {

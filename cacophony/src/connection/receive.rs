@@ -673,7 +673,7 @@ where
         let connection = self.state.internal().config.public_info();
         self.observer.rtcp_packet_received(RtcpPacketEvent {
             endpoint: &connection.endpoint,
-            guild_id: connection.server_id,
+            guild_id: connection.guild_id,
             user_id: connection.user_id,
             bytes,
             header: info.rtcp_header(bytes),

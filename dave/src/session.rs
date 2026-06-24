@@ -73,20 +73,16 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(
-        protocol_version: NonZeroU16,
-        user_id: u64,
-        channel_id: u64,
-    ) -> Result<Self, InitError> {
-        let ciphersuite = protocol_version_to_ciphersuite(protocol_version)?;
-        let capabilities = protocol_version_to_capabilities(protocol_version)?;
+    pub fn new(user_id: u64, channel_id: u64) -> Result<Self, InitError> {
+        let ciphersuite = supported_ciphersuite();
+        let capabilities = supported_capabilities();
         let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm())?;
         let credential_with_key = CredentialWithKey {
             credential: BasicCredential::new(user_id.to_be_bytes().into()).into(),
             signature_key: signer.public().into(),
         };
         Ok(Self {
-            protocol_version,
+            protocol_version: DAVE_PROTOCOL_VERSION,
             capabilities,
             user_id,
             channel_id,
@@ -565,14 +561,22 @@ fn protocol_version_to_ciphersuite(
     }
 }
 
-fn protocol_version_to_capabilities(
+pub fn validate_protocol_version(
     protocol_version: NonZeroU16,
-) -> Result<Capabilities, UnsupportedProtocolVersion> {
-    Ok(Capabilities::builder()
+) -> Result<(), UnsupportedProtocolVersion> {
+    protocol_version_to_ciphersuite(protocol_version).map(|_| ())
+}
+
+fn supported_ciphersuite() -> Ciphersuite {
+    Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+}
+
+fn supported_capabilities() -> Capabilities {
+    Capabilities::builder()
         .versions(vec![ProtocolVersion::Mls10])
-        .ciphersuites(vec![protocol_version_to_ciphersuite(protocol_version)?])
+        .ciphersuites(vec![supported_ciphersuite()])
         .extensions(vec![])
         .proposals(vec![])
         .credentials(vec![CredentialType::Basic])
-        .build())
+        .build()
 }

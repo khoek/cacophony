@@ -76,7 +76,7 @@ where
         if let (Some(build_elapsed), Some(send_started)) = (build_elapsed, send_started) {
             self.observer.udp_packet_sent(UdpPacketSentEvent {
                 endpoint: &connection.endpoint,
-                guild_id: connection.server_id,
+                guild_id: connection.guild_id,
                 user_id: connection.user_id,
                 dave: requires_dave,
                 payload_bytes,

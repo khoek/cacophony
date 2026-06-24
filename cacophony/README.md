@@ -41,26 +41,28 @@ Non-Opus Discord media is rejected explicitly.
 ## Example
 
 ```rust
-use cacophony::{ConnectionConfig, Result, connect};
+use cacophony::{ConnectionConfig, Result};
 use cacophony::opus::discord::Packet;
 
 async fn play_one_packet(
     guild_id: u64,
     channel_id: u64,
-    bot_user_id: u64,
+    user_id: u64,
     session_id: String,
     token: String,
     endpoint: String,
     opus_packet: Vec<u8>,
 ) -> Result<()> {
-    let connection = connect(ConnectionConfig::new(
+    let connection = ConnectionConfig {
         guild_id,
         channel_id,
-        bot_user_id,
+        user_id,
         session_id,
         token,
         endpoint,
-    )).await?;
+    }
+    .connect()
+    .await?;
 
     let playout = connection.start_opus_playout().await?;
     playout.push_packet_owned(Packet {
@@ -80,7 +82,7 @@ without wiring tracing into the runtime:
 ```rust
 use cacophony::{
     ConnectionConfig, ConnectionObserver, Result, UdpPacketSentEvent,
-    WebSocketClosedEvent, connect_with_observer,
+    WebSocketClosedEvent,
 };
 
 #[derive(Clone)]
@@ -99,7 +101,7 @@ impl ConnectionObserver for Metrics {
 }
 
 async fn connect_with_metrics(config: ConnectionConfig) -> Result<()> {
-    let connection = connect_with_observer(config, Metrics).await?;
+    let connection = config.connect_with_observer(Metrics).await?;
     let _ = connection;
     Ok(())
 }
@@ -112,16 +114,14 @@ queues or tasks.
 Raw packet retention is opt-in:
 
 ```rust
-use cacophony::connect_with_observer_and_raw;
 use cacophony::low_level::RawFramePackets;
 
 async fn receive_with_raw_packets(
     config: cacophony::ConnectionConfig,
 ) -> cacophony::Result<()> {
-    let connection = connect_with_observer_and_raw::<_, RawFramePackets>(
-        config,
-        cacophony::NoopConnectionObserver,
-    ).await?;
+    let connection = config
+        .connect_with_observer_and_raw::<_, RawFramePackets>(cacophony::NoopConnectionObserver)
+        .await?;
     let mut frames = connection.frame_stream(4096).await?;
     let frame = frames.recv().await?;
     eprintln!("captured {} RTP packet(s)", frame.raw.packets.len());

@@ -47,10 +47,10 @@ truncated nonces, and tags before reconstructing the decrypted encoded frame.
 ## Example
 
 ```rust
-use dave::{DAVE_PROTOCOL_VERSION, MediaFrame, Opus, Session};
+use dave::{MediaFrame, Opus, Session};
 
 fn new_session(user_id: u64, channel_id: u64) -> Result<Session, dave::InitError> {
-    Session::new(DAVE_PROTOCOL_VERSION, user_id, channel_id)
+    Session::new(user_id, channel_id)
 }
 
 fn opus_frame(bytes: &[u8]) -> MediaFrame<'_, Opus> {

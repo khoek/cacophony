@@ -59,9 +59,10 @@ use crate::{
     },
     queue::DriverReply,
     state::{
-        ConnectionConfig, ConnectionInternalState, ConnectionTuning, DaveInternalState,
-        DavePendingMediaRetry, EncryptionMode, PendingDaveMediaQueues, PendingMediaFrame,
-        PendingMediaPacket, ReceiveSsrcState, ReceiveState, SecretKey, SessionDescription,
+        ConnectionConfig, ConnectionInternalState, ConnectionOptions, ConnectionTuning,
+        DaveInternalState, DavePendingMediaRetry, EncryptionMode, PendingDaveMediaQueues,
+        PendingMediaFrame, PendingMediaPacket, ReceiveSsrcState, ReceiveState, SecretKey,
+        SessionDescription,
     },
 };
 
@@ -74,10 +75,24 @@ type TestReceiveState = ReceiveState<NoRawPackets>;
 type TestReceiveSsrcState = ReceiveSsrcState<NoRawPackets>;
 type TestReadyVoiceFrameQueue = ReadyFrameQueue<NoRawPackets>;
 
+fn test_connection_config() -> ConnectionConfig {
+    ConnectionConfig {
+        guild_id: 1,
+        channel_id: 2,
+        user_id: 3,
+        session_id: "session".to_string(),
+        token: "token".to_string(),
+        endpoint: "127.0.0.1".to_string(),
+    }
+}
+
 fn test_state() -> ConnectionInternalState {
     let selected_mode = EncryptionMode::aead_aes256_gcm_rtpsize();
     ConnectionInternalState {
-        config: ConnectionConfig::new(1, 2, 3, "session", "token", "127.0.0.1"),
+        config: test_connection_config()
+            .validate()
+            .unwrap()
+            .runtime_config(),
         heartbeat_interval_ms: 50,
         last_seq: None,
         ready: GatewayReady {
@@ -178,14 +193,14 @@ async fn test_connection() -> TestVoiceConnection {
 
 #[test]
 fn default_config_uses_dave_protocol_version() {
-    let config = ConnectionConfig::new(1, 2, 3, "session", "token", "127.0.0.1");
+    let config = test_connection_config().validate().unwrap();
 
     assert_eq!(
-        config.max_dave_protocol_version,
+        config.options().max_dave_protocol_version,
         Some(DAVE_PROTOCOL_VERSION.get())
     );
     assert_eq!(
-        config.dave_send_media_ready_timeout,
+        config.options().dave_send_media_ready_timeout,
         DAVE_SEND_MEDIA_READY_TIMEOUT
     );
 }
@@ -652,9 +667,9 @@ fn session_description_debug_and_json_do_not_expose_secret_key() {
 
 #[test]
 fn unsupported_voice_encryption_modes_fail_selection() {
-    let config = ConnectionConfig::new(1, 2, 3, "session", "token", "127.0.0.1");
+    let options = ConnectionOptions::default();
     let error = select_encryption_mode(
-        &config,
+        &options,
         &GatewayReady {
             ssrc: 42,
             ip: "127.0.0.1".to_string(),

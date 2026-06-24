@@ -40,8 +40,7 @@ mod stats;
 
 pub use ::dave::MediaType;
 pub use connection::{
-    Connection, DurationDistribution, FrameStream, OpusPlayout, OpusPlayoutStats, connect,
-    connect_with_observer, connect_with_observer_and_raw,
+    Connection, DurationDistribution, FrameStream, OpusPlayout, OpusPlayoutStats,
 };
 pub use dave::{
     DaveGatewayStateEvent, DaveIgnoredProposalsEvent, DaveKeyPackageEvent, DaveMediaStatus,
@@ -67,8 +66,9 @@ pub use observer::{
     WebSocketClosedEvent, WebSocketCommandFailedEvent, WebSocketFrameKind, WebSocketTextEvent,
 };
 pub use state::{
-    ConnectionConfig, ConnectionInfo, ConnectionState, ConnectionStateSnapshot, ConnectionTuning,
-    DaveMlsState, DavePendingMlsState, DaveState, EncryptionMode, SessionId, SessionState, Token,
+    ConnectionConfig, ConnectionInfo, ConnectionOptions, ConnectionRequest, ConnectionState,
+    ConnectionStateSnapshot, ConnectionTuning, DaveMlsState, DavePendingMlsState, DaveState,
+    EncryptionMode, SessionState, ValidatedConnectionConfig,
 };
 
 pub mod low_level {

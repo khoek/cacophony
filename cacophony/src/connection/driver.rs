@@ -38,7 +38,10 @@ use crate::{
         WebSocketCommandFailedEvent, WebSocketFrameKind, WebSocketTextEvent,
     },
     queue::{DeadlineQueue, DriverReply},
-    state::{ConnectionConfig, ConnectionInternalState, DaveInternalState, SessionDescription},
+    state::{
+        ConnectionConfig, ConnectionInternalState, ConnectionRequest, DaveInternalState,
+        SessionDescription, ValidatedConnectionConfig,
+    },
 };
 
 use super::{
@@ -85,7 +88,7 @@ where
             let connection = self.state.internal().config.public_info();
             self.observer.control_task_failed(ConnectionErrorEvent {
                 endpoint: &connection.endpoint,
-                guild_id: connection.server_id,
+                guild_id: connection.guild_id,
                 user_id: connection.user_id,
                 error,
             });
@@ -165,7 +168,7 @@ where
                         let connection = self.state.internal().config.public_info();
                         self.observer.udp_packet_received(UdpPacketReceivedEvent {
                             endpoint: &connection.endpoint,
-                            guild_id: connection.server_id,
+                            guild_id: connection.guild_id,
                             user_id: connection.user_id,
                             bytes: received,
                             elapsed: started.elapsed(),
@@ -272,7 +275,7 @@ where
                 let event = parse_event_text(&text)?;
                 self.observer.websocket_text_event(WebSocketTextEvent {
                     endpoint: &connection.endpoint,
-                    guild_id: connection.server_id,
+                    guild_id: connection.guild_id,
                     user_id: connection.user_id,
                     opcode: event.opcode,
                     seq: event.seq,
@@ -295,7 +298,7 @@ where
             Some(Ok(WsMessage::Binary(bytes))) => {
                 self.observer.websocket_binary_event(WebSocketBinaryEvent {
                     endpoint: &connection.endpoint,
-                    guild_id: connection.server_id,
+                    guild_id: connection.guild_id,
                     user_id: connection.user_id,
                     bytes: bytes.len(),
                     first_byte: bytes.first().copied(),
@@ -307,7 +310,7 @@ where
             Some(Ok(WsMessage::Close(frame))) => {
                 self.observer.websocket_closed(WebSocketClosedEvent {
                     endpoint: &connection.endpoint,
-                    guild_id: connection.server_id,
+                    guild_id: connection.guild_id,
                     user_id: connection.user_id,
                     frame: frame.as_ref().map(WebSocketCloseFrame::from_frame),
                 });
@@ -318,7 +321,7 @@ where
             Some(Err(error)) => {
                 self.observer.websocket_read_failed(ConnectionErrorEvent {
                     endpoint: &connection.endpoint,
-                    guild_id: connection.server_id,
+                    guild_id: connection.guild_id,
                     user_id: connection.user_id,
                     error: &error,
                 });
@@ -359,7 +362,7 @@ where
                 self.observer
                     .websocket_command_failed(WebSocketCommandFailedEvent {
                         endpoint: &connection.endpoint,
-                        guild_id: connection.server_id,
+                        guild_id: connection.guild_id,
                         user_id: connection.user_id,
                         frame_kind: WebSocketFrameKind::Binary,
                         opcode: command.opcode().code(),
@@ -373,7 +376,7 @@ where
                 self.observer
                     .websocket_command_failed(WebSocketCommandFailedEvent {
                         endpoint: &connection.endpoint,
-                        guild_id: connection.server_id,
+                        guild_id: connection.guild_id,
                         user_id: connection.user_id,
                         opcode: command.opcode().code(),
                         frame_kind: WebSocketFrameKind::Text,
@@ -493,36 +496,97 @@ where
     }
 }
 
-pub async fn connect(
-    config: ConnectionConfig,
-) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
-    connect_with_observer(config, NoopConnectionObserver).await
+impl ConnectionConfig {
+    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
+        self.validate()?.connect().await
+    }
+
+    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
+    where
+        O: ConnectionObserver,
+    {
+        self.validate()?.connect_with_observer(observer).await
+    }
+
+    pub async fn connect_with_observer_and_raw<O, Raw>(
+        self,
+        observer: O,
+    ) -> Result<Connection<O, Raw>>
+    where
+        O: ConnectionObserver,
+        Raw: FrameRaw,
+    {
+        self.validate()?
+            .connect_with_observer_and_raw(observer)
+            .await
+    }
 }
 
-pub async fn connect_with_observer<O>(
-    config: ConnectionConfig,
-    observer: O,
-) -> Result<Connection<O, NoRawPackets>>
-where
-    O: ConnectionObserver,
-{
-    connect_with_observer_and_raw(config, observer).await
+impl ConnectionRequest {
+    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
+        self.validate()?.connect().await
+    }
+
+    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
+    where
+        O: ConnectionObserver,
+    {
+        self.validate()?.connect_with_observer(observer).await
+    }
+
+    pub async fn connect_with_observer_and_raw<O, Raw>(
+        self,
+        observer: O,
+    ) -> Result<Connection<O, Raw>>
+    where
+        O: ConnectionObserver,
+        Raw: FrameRaw,
+    {
+        self.validate()?
+            .connect_with_observer_and_raw(observer)
+            .await
+    }
 }
 
-pub async fn connect_with_observer_and_raw<O, Raw>(
-    config: ConnectionConfig,
+impl ValidatedConnectionConfig {
+    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
+        self.connect_with_observer(NoopConnectionObserver).await
+    }
+
+    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
+    where
+        O: ConnectionObserver,
+    {
+        self.connect_with_observer_and_raw(observer).await
+    }
+
+    pub async fn connect_with_observer_and_raw<O, Raw>(
+        self,
+        observer: O,
+    ) -> Result<Connection<O, Raw>>
+    where
+        O: ConnectionObserver,
+        Raw: FrameRaw,
+    {
+        connect_validated_with_observer_and_raw(self, observer).await
+    }
+}
+
+async fn connect_validated_with_observer_and_raw<O, Raw>(
+    config: ValidatedConnectionConfig,
     observer: O,
 ) -> Result<Connection<O, Raw>>
 where
     O: ConnectionObserver,
     Raw: FrameRaw,
 {
-    let websocket_url = config.websocket_url()?;
-    let tuning = config.tuning;
+    let websocket_url = config.websocket_url.clone();
+    let runtime_config = config.runtime_config();
+    let tuning = config.options.tuning;
     let endpoint = config.endpoint.clone();
-    let guild_id = config.server_id;
-    let channel_id = config.channel_id;
-    let user_id = config.user_id;
+    let guild_id = config.identity.guild_id;
+    let channel_id = config.identity.channel_id;
+    let user_id = config.identity.user_id;
     let (ws_stream, _) = observed_stage_timeout(
         &observer,
         ConnectionEvent {
@@ -590,7 +654,7 @@ where
     )
     .await?;
     let discovery = UdpDiscoveryPacket::decode(&discovery_buffer[..received])?;
-    let selected_mode = select_encryption_mode(&config, &ready)?;
+    let selected_mode = select_encryption_mode(&config.options, &ready)?;
 
     write
         .send(WsMessage::Text(
@@ -620,7 +684,7 @@ where
     let dave_protocol_version = session_description.dave_protocol_version;
 
     let initial_state = ConnectionInternalState {
-        config,
+        config: runtime_config,
         heartbeat_interval_ms: hello_data.heartbeat_interval_ms(),
         last_seq,
         ready,

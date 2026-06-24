@@ -16,6 +16,9 @@ pub use frame::{
     Av1, Codec, DynamicMediaFrame, FrameCodec, H264, H265, MediaFrame, MediaType,
     OPUS_SILENCE_FRAME, Opus, Vp8, Vp9,
 };
-pub use session::{CommitWelcome, FrameEncryptResult, ProposalsOperation, Session, SessionStatus};
+pub use session::{
+    CommitWelcome, FrameEncryptResult, ProposalsOperation, Session, SessionStatus,
+    validate_protocol_version,
+};
 
 pub const DAVE_PROTOCOL_VERSION: NonZeroU16 = NonZeroU16::new(1).unwrap();

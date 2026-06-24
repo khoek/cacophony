@@ -29,7 +29,7 @@ use crate::{
     },
     gateway::GatewayReady,
     observer::RtcpHeader,
-    state::{ConnectionConfig, ConnectionInternalState, EncryptionMode, SessionDescription},
+    state::{ConnectionInternalState, ConnectionOptions, EncryptionMode, SessionDescription},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -763,10 +763,10 @@ pub(crate) fn next_heartbeat_nonce(current: &mut u64) -> u64 {
 }
 
 pub(crate) fn select_encryption_mode(
-    config: &ConnectionConfig,
+    options: &ConnectionOptions,
     ready: &GatewayReady,
 ) -> Result<EncryptionMode> {
-    if let Some(preferred_mode) = &config.preferred_mode
+    if let Some(preferred_mode) = &options.preferred_mode
         && ready.modes.contains(preferred_mode)
     {
         return Ok(preferred_mode.clone());
