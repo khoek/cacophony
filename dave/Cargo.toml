@@ -1,0 +1,33 @@
+[package]
+name = "dave"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "AGPL-3.0-only"
+description = "Rust DAVE primitives with Discord Opus audio and video frame transform support."
+readme = "README.md"
+repository = "https://github.com/khoek/cacophony"
+keywords = ["discord", "voice", "e2ee", "mls", "dave"]
+categories = ["cryptography", "multimedia::audio", "network-programming"]
+
+[dependencies]
+aead = "0.6"
+aes = { version = "0.9", features = ["zeroize"] }
+cipher = "0.5"
+ctr = "0.10"
+ghash = { version = "0.6", features = ["zeroize"] }
+hmac = "0.13"
+openmls = { version = "0.8", features = ["js"] }
+openmls_basic_credential = "0.5"
+openmls_rust_crypto = "0.5"
+p256 = "0.13"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+subtle = "2"
+thiserror = "2"
+tls_codec = { version = "0.4", features = ["derive"] }
+zeroize = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"

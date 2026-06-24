@@ -1,0 +1,19 @@
+mod driver;
+mod handle;
+mod playout;
+mod receive;
+mod send;
+
+pub use driver::{connect, connect_with_observer, connect_with_observer_and_raw};
+pub use handle::Connection;
+pub(crate) use handle::{
+    ConnectionClose, ConnectionCommand, ConnectionInner, ConnectionStateStore,
+    spawn_voice_connection_join_task, wait_for_close,
+};
+pub(crate) use playout::PlayoutCommand;
+pub use playout::{DurationDistribution, OpusPlayout, OpusPlayoutStats};
+#[cfg(test)]
+pub(crate) use receive::ReadyFrameQueue;
+pub(crate) use receive::{LowLevelReceiveKind, PendingReceive};
+#[cfg(test)]
+pub(crate) use receive::{limit_raw_packet_result, limit_voice_frame_result};
