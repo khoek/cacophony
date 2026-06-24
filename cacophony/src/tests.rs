@@ -37,7 +37,7 @@ use crate::{
         SpeakingFlags, UdpDiscoveryPacket, handle_voice_binary_event, handle_voice_text_event,
     },
     media::{
-        Codec, FrameRaw, NoRawPackets, OutboundEncryptParams, RawFramePackets, RawUdpPacket,
+        FrameRaw, MediaCodec, NoRawPackets, OutboundEncryptParams, RawFramePackets, RawUdpPacket,
         RawUdpPacketInfo, ReceivedFrame, RtpHeader, build_rtp_header, decrypt_transport_payload,
         detect_rtp_codec, encrypt_transport_payload, ordered_voice_socket_addrs, parse_rtp_header,
         select_encryption_mode, udp_bind_addr_for_remote, update_state, websocket_host_port,
@@ -47,7 +47,7 @@ use crate::{
         ReceiveFrameDroppedEvent, ReceiveRtpPacketLossEvent, RtcpHeader,
     },
     opus::{
-        Decoder,
+        Decoder, PayloadCodec as OpusPayloadCodec,
         discord::{
             CHANNELS, EncodeConfig, MAX_PACKET_BYTES, PacketEncoder, PcmBlock, PcmEncoder,
             RTP_PAYLOAD_TYPE, SAMPLE_RATE_HZ, SAMPLES_PER_CHANNEL, STEREO_SAMPLES_PER_BLOCK,
@@ -57,6 +57,7 @@ use crate::{
         ALaw, F32, Mono, MonoSincResampler, MuLaw, PcmChunk, PcmEncoding, S16Le, Samples,
         StereoInterleaved, interleaved_i16_to_mono_s16le, s16le_rms,
     },
+    queue::DriverReply,
     state::{
         ConnectionConfig, ConnectionInternalState, ConnectionTuning, DaveInternalState,
         DavePendingMediaRetry, EncryptionMode, PendingDaveMediaQueues, PendingMediaFrame,
@@ -68,7 +69,7 @@ const TEST_DISCORD_ID: u64 = 0xDEADBEEF;
 const TEST_DISCORD_ID_JSON: &str = "3735928559";
 
 type TestVoiceConnection = Connection<NoopConnectionObserver, NoRawPackets>;
-type TestPendingFrameReceive = PendingReceive<ReceivedFrame<NoRawPackets>>;
+type TestPendingPacketReceive = PendingReceive<RawUdpPacket>;
 type TestReceiveState = ReceiveState<NoRawPackets>;
 type TestReceiveSsrcState = ReceiveSsrcState<NoRawPackets>;
 type TestReadyVoiceFrameQueue = ReadyFrameQueue<NoRawPackets>;
@@ -207,34 +208,29 @@ async fn recv_raw_udp_packet_returns_closed_when_connection_closes() {
 }
 
 #[tokio::test]
-async fn timed_receive_request_expires_without_consuming_future_media() {
-    let (response, receive) = oneshot::channel();
-    let request: TestPendingFrameReceive = PendingReceive {
-        id: 1,
-        max_len: 1200,
-        deadline: Some(Instant::now() - Duration::from_millis(1)),
-        max_wait: Some(Duration::from_millis(1)),
-        response,
-    };
+async fn frame_stream_returns_closed_when_connection_closes() {
+    let connection = test_connection().await;
+    let receive = tokio::spawn({
+        let connection = connection.clone();
+        async move { connection.frame_stream(1200).await }
+    });
 
-    assert!(request.is_expired(Instant::now()));
-    request.complete_timeout();
-    assert!(matches!(
-        receive.await.unwrap(),
-        Err(Error::Timeout { stage: None, .. })
-    ));
+    tokio::task::yield_now().await;
+    assert!(connection.close());
+    let result = timeout(Duration::from_secs(1), receive)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Closed)));
 }
 
 #[test]
-fn abandoned_receive_request_is_inactive() {
+fn abandoned_low_level_receive_request_is_inactive() {
     let (response, receive) = oneshot::channel();
     drop(receive);
-    let request: TestPendingFrameReceive = PendingReceive {
-        id: 1,
+    let request: TestPendingPacketReceive = PendingReceive {
         max_len: 1200,
-        deadline: None,
-        max_wait: None,
-        response,
+        response: DriverReply::new(response),
     };
 
     assert!(request.is_closed());
@@ -449,7 +445,7 @@ fn rtp_codec_detection_accepts_only_opus_audio_payloads() {
 
     assert_eq!(
         detect_rtp_codec(&rtp, &session_description).unwrap(),
-        Codec::Opus
+        MediaCodec::Opus
     );
 
     session_description.audio_codec = Some("aac".to_string());
@@ -464,7 +460,7 @@ fn rtp_codec_detection_accepts_only_opus_audio_payloads() {
         Err(UnsupportedCodecError::UnsupportedRtpPayloadType {
             payload_type,
             expected_payload_type: RTP_PAYLOAD_TYPE,
-            codec: Codec::Opus,
+            codec: MediaCodec::Opus,
         }) if payload_type == RTP_PAYLOAD_TYPE + 1
     ));
 }
@@ -474,7 +470,7 @@ fn missing_dave_user_is_typed_error() {
     let mut dave = DaveCoordinator::new(1, 2).unwrap();
     let mut output = Vec::new();
     assert_eq!(
-        dave.decrypt_discord_voice_frame_into(None, b"frame", &mut output)
+        dave.decrypt_media_frame_into::<OpusPayloadCodec>(None, b"frame", &mut output)
             .unwrap_err(),
         DaveDecryptError::MissingUser
     );
@@ -815,7 +811,7 @@ fn opus_round_trip_decodes_one_discord_frame() {
             },
             user_id: Some(1),
             media_type: MediaType::Audio,
-            codec: Codec::Opus,
+            codec: MediaCodec::Opus,
             frame: opus.bytes,
         })
         .unwrap();
@@ -1055,7 +1051,7 @@ fn test_pending_media(ssrc: u32, seq: u16) -> PendingMediaPacket<NoRawPackets> {
             encrypted_body_offset: 12,
         },
         user_id: Some(TEST_DISCORD_ID),
-        codec: Codec::Opus,
+        codec: MediaCodec::Opus,
         encrypted_payload: vec![seq as u8],
         dave: false,
     }
@@ -1081,7 +1077,7 @@ fn test_pending_raw_media(
             encrypted_body_offset: 12,
         },
         user_id: Some(TEST_DISCORD_ID),
-        codec: Codec::Opus,
+        codec: MediaCodec::Opus,
         encrypted_payload: vec![seq as u8],
         dave: false,
     }
@@ -1097,7 +1093,7 @@ fn test_received_frame_with_seq(seq: u16, frame: Vec<u8>) -> ReceivedFrame {
         rtp: test_rtp_header_with_seq(seq, RTP_PAYLOAD_TYPE),
         user_id: Some(1),
         media_type: MediaType::Audio,
-        codec: Codec::Opus,
+        codec: MediaCodec::Opus,
         frame,
     }
 }
@@ -1115,7 +1111,7 @@ fn test_pending_frame(ssrc: u32, seq: u16) -> PendingMediaFrame<NoRawPackets> {
         raw: NoRawPackets,
         rtp,
         user_id: Some(TEST_DISCORD_ID),
-        codec: Codec::Opus,
+        codec: MediaCodec::Opus,
         encrypted_frame: vec![seq as u8],
         dave: true,
         enqueued_at: Instant::now(),
@@ -1468,9 +1464,9 @@ fn pending_dave_media_deadline_uses_bucket_heads() {
         DavePendingMediaReason::GatewayPending,
     ));
 
-    assert_eq!(queues.deadline(ttl), Some(expired_at + ttl));
+    assert_eq!(queues.deadline(), Some(expired_at + ttl));
     let mut expired = Vec::new();
-    while let Some(media) = queues.pop_expired(now, ttl) {
+    while let Some(media) = queues.pop_expired(now) {
         expired.push(media);
     }
 
@@ -1499,7 +1495,7 @@ fn pending_dave_media_deadline_uses_earliest_bucket_head() {
         DavePendingMediaReason::GatewayPending,
     ));
 
-    assert_eq!(queues.deadline(ttl), Some(older + ttl));
+    assert_eq!(queues.deadline(), Some(older + ttl));
 }
 
 #[test]
@@ -1760,8 +1756,7 @@ fn receive_interarrival_stats_use_bounded_sorted_window() {
         state.record_interarrival(interarrival_us);
     }
 
-    assert_eq!(state.interarrival_order.len(), window);
-    assert_eq!(state.interarrival_sorted.len(), window);
+    assert_eq!(state.interarrival.len(), window);
     assert_eq!(state.interarrival_p95_us(), Some(252));
     assert_eq!(state.interarrival_max_us(), Some(265));
 }

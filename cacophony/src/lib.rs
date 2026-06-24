@@ -25,6 +25,7 @@ type GatewayWebSocketConnectResult = (GatewayWebSocketStream, WebSocketResponse)
 type GatewayWebSocketRead = SplitStream<GatewayWebSocketStream>;
 type GatewayWebSocketWrite = SplitSink<GatewayWebSocketStream, WsMessage>;
 
+mod buffer;
 mod connection;
 mod dave;
 mod errors;
@@ -35,10 +36,11 @@ pub mod opus;
 pub mod pcm;
 mod queue;
 mod state;
+mod stats;
 
 pub use ::dave::MediaType;
 pub use connection::{
-    Connection, DurationDistribution, OpusPlayout, OpusPlayoutStats, connect,
+    Connection, DurationDistribution, FrameStream, OpusPlayout, OpusPlayoutStats, connect,
     connect_with_observer, connect_with_observer_and_raw,
 };
 pub use dave::{
@@ -53,8 +55,7 @@ pub use errors::{
 };
 pub use gateway::{SpeakingFlags, SpeakingUpdate};
 pub use media::{
-    Codec, DecodedFrame, DecodedFrameMetadata, FrameRaw, NoRawPackets, OutboundPacket,
-    RawFramePackets, ReceivedFrame, RtpHeader, RtpPayload, RtpPayloadCodec,
+    DecodedFrame, DecodedFrameMetadata, FrameRaw, NoRawPackets, OutboundPacket, ReceivedFrame,
 };
 pub use observer::{
     ClientsConnectedEvent, ConnectStage, ConnectStageCompletedEvent, ConnectStageFailedEvent,
@@ -72,7 +73,10 @@ pub use state::{
 
 pub mod low_level {
     pub use crate::gateway::{DiscordId, GatewayReady, UdpDiscoveryPacket};
-    pub use crate::media::{RawUdpPacket, RawUdpPacketInfo};
+    pub use crate::media::{
+        EncryptedMediaCodec, MediaCodec, RawFramePackets, RawUdpPacket, RawUdpPacketInfo,
+        RtpHeader, RtpPayload, RtpPayloadCodec,
+    };
     pub use crate::state::SessionDescription;
 }
 

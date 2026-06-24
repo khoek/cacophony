@@ -8,7 +8,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, oneshot},
+    sync::mpsc,
     time::{Instant, interval, timeout},
 };
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -37,7 +37,7 @@ use crate::{
         WebSocketBinaryEvent, WebSocketCloseFrame, WebSocketClosedEvent,
         WebSocketCommandFailedEvent, WebSocketFrameKind, WebSocketTextEvent,
     },
-    queue::DeadlineQueue,
+    queue::{DeadlineQueue, DriverReply},
     state::{ConnectionConfig, ConnectionInternalState, DaveInternalState, SessionDescription},
 };
 
@@ -48,7 +48,7 @@ use super::{
 use super::{playout::ActiveOpusPlayout, receive::ReceivePipeline, send::SendPipeline};
 
 pub(crate) struct PendingMediaReadyWait {
-    response: oneshot::Sender<Result<DaveMediaStatus>>,
+    response: DriverReply<DaveMediaStatus>,
     max_wait: Duration,
 }
 
@@ -110,7 +110,7 @@ where
 
         loop {
             self.discard_inactive_pending_receives();
-            self.resolve_pending_receives();
+            self.flush_frame_stream();
             self.discard_inactive_pending_receives();
             self.resolve_pending_media_ready_waits();
             self.resolve_active_playout(&mut close_rx).await?;
@@ -158,7 +158,7 @@ where
                     let _ = self.write.send(WsMessage::Close(None)).await;
                     break;
                 }
-                received = self.udp_socket.recv(&mut self.receive.udp_buffer) => {
+                received = self.udp_socket.recv(self.receive.udp_buffer.as_mut_slice()) => {
                     let started = O::ENABLE_TIMING.then(Instant::now);
                     let received = received?;
                     if let Some(started) = started {
@@ -180,7 +180,7 @@ where
                 }, if wake_deadline.is_some() => {
                     self.expire_pending_dave_media();
                     self.collect_ready_voice_frames();
-                    self.resolve_pending_receives();
+                    self.flush_frame_stream();
                     self.resolve_active_playout(&mut close_rx).await?;
                 }
                 message = self.read.next() => {
@@ -198,7 +198,7 @@ where
                     self.resolve_pending_media_ready_waits();
                     self.retry_pending_dave_media(effects.retry_dave_pending_media);
                     self.collect_ready_voice_frames();
-                    self.resolve_pending_receives();
+                    self.flush_frame_stream();
                     self.resolve_active_playout(&mut close_rx).await?;
                 }
             }
@@ -227,31 +227,20 @@ where
                 self.receive.push_packet_receive(
                     kind,
                     PendingReceive {
-                        id: 0,
                         max_len,
-                        deadline: None,
-                        max_wait: None,
-                        response,
+                        response: DriverReply::new(response),
                     },
                 );
             }
-            ConnectionCommand::RecvVoiceFrame {
-                max_len,
-                max_wait,
-                response,
-            } => {
-                let id = self.receive.next_receive_id();
-                let deadline = max_wait.map(|max_wait| Instant::now() + max_wait);
-                self.receive
-                    .pending_frame_receives
-                    .push_back(PendingReceive {
-                        id,
-                        max_len,
-                        deadline,
-                        max_wait,
-                        response,
-                    });
-                self.resolve_pending_receives();
+            ConnectionCommand::OpenFrameStream { frames, response } => {
+                match self.receive.attach_frame_stream(frames) {
+                    Ok(()) => {
+                        response.complete(Ok(()));
+                        self.collect_ready_voice_frames();
+                        self.flush_frame_stream();
+                    }
+                    Err(error) => response.complete(Err(error)),
+                }
             }
             ConnectionCommand::DaveMediaStatus { response } => {
                 let _ = response.send(self.current_dave_media_status());
@@ -420,13 +409,13 @@ where
         let status = self.current_dave_media_status();
         if status.media_ready {
             self.pending_media_ready_waits.drain_all(|wait| {
-                let _ = wait.response.send(Ok(status));
+                wait.response.complete(Ok(status));
             });
             return;
         }
         self.pending_media_ready_waits
             .drain_expired(Instant::now(), |wait| {
-                let _ = wait.response.send(Err(Error::Timeout {
+                wait.response.complete(Err(Error::Timeout {
                     stage: None,
                     duration: wait.max_wait,
                 }));
@@ -483,7 +472,6 @@ where
                     .as_ref()
                     .and_then(ActiveOpusPlayout::dave_deadline),
             )
-            .chain(self.receive.pending_frame_receives.next_deadline())
             .chain(self.pending_media_ready_waits.next_deadline())
             .min()
     }
@@ -496,12 +484,11 @@ where
             send.complete_closed();
         }
         self.receive.complete_closed_packet_receives();
-        self.receive.pending_frame_receives.complete_closed();
         if let Some(playout) = self.send.active_playout.take() {
             playout.cancel();
         }
         self.pending_media_ready_waits.drain_all(|wait| {
-            let _ = wait.response.send(Err(Error::Closed));
+            wait.response.complete_closed();
         });
     }
 }

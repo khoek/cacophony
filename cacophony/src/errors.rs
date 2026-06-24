@@ -11,7 +11,7 @@ use dave::{
 };
 
 use crate::{
-    media::Codec,
+    media::MediaCodec,
     observer::{ConnectStage, ReceiveDecodeErrorKind},
     state::EncryptionMode,
 };
@@ -213,7 +213,7 @@ pub enum InvalidInputError {
     },
     ZeroMaxLen,
     EmptyPayload {
-        codec: Codec,
+        codec: MediaCodec,
     },
     PcmBlockSampleCount {
         expected: usize,
@@ -223,17 +223,6 @@ pub enum InvalidInputError {
         expected: usize,
         actual: usize,
     },
-    PcmSampleAlignment {
-        encoding: &'static str,
-        byte_len: usize,
-        sample_bytes: usize,
-    },
-    PcmChannelAlignment {
-        channels: usize,
-        samples: usize,
-    },
-    PcmChannelCountZero,
-    PcmResamplerChunkFramesZero,
     PcmArchiveEmpty,
     OggOpusVendorEmpty,
     OggOpusUnsupportedSampleRate {
@@ -287,22 +276,6 @@ impl fmt::Display for InvalidInputError {
                 f,
                 "Discord PCM block must contain {expected} samples per channel, got {actual}",
             ),
-            Self::PcmSampleAlignment {
-                encoding,
-                byte_len,
-                sample_bytes,
-            } => write!(
-                f,
-                "{encoding} PCM byte length {byte_len} is not aligned to {sample_bytes}-byte samples",
-            ),
-            Self::PcmChannelAlignment { channels, samples } => write!(
-                f,
-                "PCM sample count {samples} is not aligned to {channels} channels",
-            ),
-            Self::PcmChannelCountZero => f.write_str("PCM channel count must be greater than zero"),
-            Self::PcmResamplerChunkFramesZero => {
-                f.write_str("PCM resampler chunk frame count must be greater than zero")
-            }
             Self::PcmArchiveEmpty => f.write_str("captured PCM audio must not be empty"),
             Self::OggOpusVendorEmpty => f.write_str("Ogg Opus vendor must not be empty"),
             Self::OggOpusUnsupportedSampleRate { sample_rate_hz } => write!(
@@ -513,7 +486,7 @@ pub enum OpusError {
         reason: &'static str,
     },
     UnsupportedVoiceCodec {
-        codec: Codec,
+        codec: MediaCodec,
     },
     UnsupportedChannelCount {
         channels: usize,
@@ -549,6 +522,7 @@ pub enum BackpressureError {
     CommandQueueFull,
     MediaQueueFull,
     ActiveOpusPlayout,
+    ActiveFrameStream,
 }
 
 impl fmt::Display for BackpressureError {
@@ -558,6 +532,9 @@ impl fmt::Display for BackpressureError {
             Self::MediaQueueFull => f.write_str("voice connection media queue is full"),
             Self::ActiveOpusPlayout => {
                 f.write_str("voice connection already has an active Opus playout")
+            }
+            Self::ActiveFrameStream => {
+                f.write_str("voice connection already has an active media frame stream")
             }
         }
     }
@@ -610,7 +587,7 @@ pub enum UnsupportedCodecError {
     UnsupportedRtpPayloadType {
         payload_type: u8,
         expected_payload_type: u8,
-        codec: Codec,
+        codec: MediaCodec,
     },
 }
 

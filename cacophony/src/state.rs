@@ -14,13 +14,14 @@ use zeroize::Zeroizing;
 use crate::{
     errors::{Error, InvalidInputError, Result},
     gateway::{GatewayReady, SpeakingUpdate, UdpDiscoveryPacket},
-    media::{Codec, FrameRaw, RtpHeader, TransportCryptoConfig, duration_ms, duration_us},
+    media::{FrameRaw, MediaCodec, RtpHeader, TransportCryptoConfig, duration_ms, duration_us},
     observer::{
         ConnectionEvent, ConnectionObserver, DavePendingMediaEvent, DavePendingMediaReason,
         ReceiveRtpPacketEvent, ReceiveRtpPacketLossEvent, WebSocketCloseFrame,
     },
     opus::RtpFrameAssembler,
-    queue::{BucketQueue, DeadlineSet, QueueBucket},
+    queue::{BucketDeadlineQueue, DeadlineSet, QueueBucket},
+    stats::SlidingStats,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -600,7 +601,7 @@ where
     pub(crate) fn new(tuning: ConnectionTuning) -> Self {
         Self {
             tuning,
-            pending_dave_media: PendingDaveMediaQueues::default(),
+            pending_dave_media: PendingDaveMediaQueues::new(tuning.dave_pending_media_ttl),
             ssrc: HashMap::new(),
             ready_ssrcs: VecDeque::new(),
             queued_ready_ssrcs: HashSet::new(),
@@ -609,8 +610,7 @@ where
     }
 
     pub(crate) fn pending_dave_media_deadline(&self) -> Option<Instant> {
-        self.pending_dave_media
-            .deadline(self.tuning.dave_pending_media_ttl)
+        self.pending_dave_media.deadline()
     }
 
     pub(crate) fn pending_rtp_reorder_deadline(&self) -> Option<Instant> {
@@ -722,7 +722,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum DavePendingMediaBucket {
     MissingUser,
     SessionNotReady,
@@ -812,7 +812,8 @@ pub(crate) struct PendingDaveMediaQueues<Raw>
 where
     Raw: FrameRaw,
 {
-    buckets: BucketQueue<
+    ttl: Duration,
+    buckets: BucketDeadlineQueue<
         DavePendingMediaBucket,
         PendingMediaFrame<Raw>,
         { DavePendingMediaBucket::COUNT },
@@ -824,9 +825,7 @@ where
     Raw: FrameRaw,
 {
     fn default() -> Self {
-        Self {
-            buckets: BucketQueue::default(),
-        }
+        Self::new(ConnectionTuning::default().dave_pending_media_ttl)
     }
 }
 
@@ -834,6 +833,13 @@ impl<Raw> PendingDaveMediaQueues<Raw>
 where
     Raw: FrameRaw,
 {
+    pub(crate) fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            buckets: BucketDeadlineQueue::default(),
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.buckets.len()
     }
@@ -846,19 +852,8 @@ where
     pub(crate) fn push(&mut self, media: PendingMediaFrame<Raw>) -> usize {
         let bucket = DavePendingMediaBucket::from_reason(media.reason)
             .expect("queued DAVE media must have a retryable reason");
-        if self
-            .buckets
-            .back(bucket)
-            .is_none_or(|queued| queued.enqueued_at <= media.enqueued_at)
-        {
-            self.buckets.push_back(bucket, media);
-        } else {
-            let index = self
-                .buckets
-                .position(bucket, |queued| queued.enqueued_at > media.enqueued_at)
-                .expect("out-of-order queue insertion checked");
-            self.buckets.insert(bucket, index, media);
-        }
+        let deadline = media.enqueued_at + self.ttl;
+        self.buckets.push(bucket, media, deadline);
         self.len()
     }
 
@@ -866,23 +861,15 @@ where
         &mut self,
         retry: DavePendingMediaRetry,
     ) -> Option<PendingMediaFrame<Raw>> {
-        self.pop_oldest_matching(|bucket, _| retry.includes(bucket))
+        self.buckets.pop_matching(|bucket| retry.includes(*bucket))
     }
 
-    pub(crate) fn pop_expired(
-        &mut self,
-        now: Instant,
-        ttl: Duration,
-    ) -> Option<PendingMediaFrame<Raw>> {
-        self.pop_oldest_matching(|_, media| now >= media.enqueued_at + ttl)
+    pub(crate) fn pop_expired(&mut self, now: Instant) -> Option<PendingMediaFrame<Raw>> {
+        self.buckets.pop_expired(now)
     }
 
-    pub(crate) fn deadline(&self, ttl: Duration) -> Option<Instant> {
-        DavePendingMediaBucket::ALL
-            .into_iter()
-            .filter_map(|bucket| self.buckets.front(bucket))
-            .map(|media| media.enqueued_at + ttl)
-            .min()
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.buckets.next_deadline()
     }
 
     pub(crate) fn prune_ssrcs(&mut self, removed_ssrcs: &HashSet<u32>) {
@@ -890,23 +877,6 @@ where
             self.buckets
                 .retain(bucket, |media| !removed_ssrcs.contains(&media.rtp.ssrc));
         }
-    }
-
-    fn pop_oldest_matching(
-        &mut self,
-        mut include: impl FnMut(DavePendingMediaBucket, &PendingMediaFrame<Raw>) -> bool,
-    ) -> Option<PendingMediaFrame<Raw>> {
-        let bucket = DavePendingMediaBucket::ALL
-            .into_iter()
-            .filter_map(|bucket| {
-                self.buckets
-                    .front(bucket)
-                    .filter(|media| include(bucket, media))
-                    .map(|media| (bucket, media.enqueued_at))
-            })
-            .min_by_key(|(_, enqueued_at)| *enqueued_at)
-            .map(|(bucket, _)| bucket)?;
-        self.buckets.pop_front(bucket)
     }
 }
 
@@ -919,8 +889,7 @@ where
     pub(crate) next_seq: Option<u16>,
     pub(crate) missing: BTreeMap<u16, MissingRtpPacket>,
     pub(crate) pending_media: BTreeMap<u16, PendingMediaPacket<Raw>>,
-    pub(crate) interarrival_order: VecDeque<u64>,
-    pub(crate) interarrival_sorted: Vec<u64>,
+    pub(crate) interarrival: SlidingStats<u64>,
     pub(crate) assembler: RtpFrameAssembler<Raw>,
 }
 
@@ -944,8 +913,7 @@ where
             next_seq: None,
             missing: BTreeMap::new(),
             pending_media: BTreeMap::new(),
-            interarrival_order: VecDeque::new(),
-            interarrival_sorted: Vec::new(),
+            interarrival: SlidingStats::new(tuning.receive_interarrival_window),
             assembler: RtpFrameAssembler::default(),
         }
     }
@@ -1122,27 +1090,15 @@ where
         }
     }
     pub(crate) fn record_interarrival(&mut self, interarrival_us: u64) {
-        if self.interarrival_order.len() == self.tuning.receive_interarrival_window
-            && let Some(removed) = self.interarrival_order.pop_front()
-            && let Ok(index) = self.interarrival_sorted.binary_search(&removed)
-        {
-            self.interarrival_sorted.remove(index);
-        }
-        let index = self
-            .interarrival_sorted
-            .partition_point(|value| *value <= interarrival_us);
-        self.interarrival_sorted.insert(index, interarrival_us);
-        self.interarrival_order.push_back(interarrival_us);
+        self.interarrival.observe(interarrival_us);
     }
 
     pub(crate) fn interarrival_p95_us(&self) -> Option<u64> {
-        self.interarrival_sorted
-            .get(((self.interarrival_sorted.len().saturating_sub(1)) * 95) / 100)
-            .copied()
+        self.interarrival.percentile(95)
     }
 
     pub(crate) fn interarrival_max_us(&self) -> Option<u64> {
-        self.interarrival_sorted.last().copied()
+        self.interarrival.max()
     }
 }
 
@@ -1158,7 +1114,7 @@ where
     pub(crate) raw: Raw::Packet,
     pub(crate) rtp: RtpHeader,
     pub(crate) user_id: Option<u64>,
-    pub(crate) codec: Codec,
+    pub(crate) codec: MediaCodec,
     pub(crate) encrypted_payload: Vec<u8>,
     pub(crate) dave: bool,
 }
@@ -1170,7 +1126,7 @@ where
     pub(crate) raw: Raw,
     pub(crate) rtp: RtpHeader,
     pub(crate) user_id: Option<u64>,
-    pub(crate) codec: Codec,
+    pub(crate) codec: MediaCodec,
     pub(crate) encrypted_frame: Vec<u8>,
     pub(crate) dave: bool,
     pub(crate) enqueued_at: Instant,

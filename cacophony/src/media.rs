@@ -164,9 +164,13 @@ impl FrameRaw for RawFramePackets {
 }
 
 pub trait RtpPayloadCodec: Copy + Send + Sync + 'static {
-    const CODEC: Codec;
+    const CODEC: MediaCodec;
     const DISCORD_PAYLOAD_TYPE: u8;
     const SAMPLE_RATE_HZ: u32;
+}
+
+pub trait EncryptedMediaCodec: RtpPayloadCodec {
+    type DaveCodec: dave::FrameCodec;
 }
 
 pub trait RtpPayload {
@@ -234,7 +238,7 @@ where
     pub rtp: RtpHeader,
     pub user_id: Option<u64>,
     pub media_type: MediaType,
-    pub codec: Codec,
+    pub codec: MediaCodec,
     pub frame: Vec<u8>,
 }
 
@@ -251,11 +255,11 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Codec {
+pub enum MediaCodec {
     Opus,
 }
 
-impl Codec {
+impl MediaCodec {
     pub fn from_discord_audio_name(name: &str) -> Option<Self> {
         name.eq_ignore_ascii_case("opus").then_some(Self::Opus)
     }
@@ -267,7 +271,7 @@ impl Codec {
     }
 }
 
-impl fmt::Display for Codec {
+impl fmt::Display for MediaCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Opus => f.write_str("Opus"),
@@ -341,7 +345,7 @@ where
         let timestamp = self.timestamp;
         let nonce_suffix = self.nonce_suffix.to_be_bytes();
         let payload_bytes = frame.len();
-        transport_crypto.encrypt_payload(
+        let rtp = transport_crypto.encrypt_payload(
             OutboundEncryptParams {
                 seq,
                 timestamp,
@@ -352,7 +356,6 @@ where
             frame,
             packet,
         )?;
-        let rtp = parse_rtp_header(packet)?;
 
         self.seq = self.seq.wrapping_add(1);
         self.timestamp = self
@@ -521,10 +524,10 @@ impl TransportCrypto {
         params: OutboundEncryptParams,
         frame: &[u8],
         packet: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<RtpHeader> {
         packet.clear();
         packet.reserve(12 + frame.len() + AEAD_TAG_LEN + RTPSIZE_NONCE_LEN);
-        write_rtp_header(
+        let rtp = write_rtp_header(
             packet,
             params.seq,
             params.timestamp,
@@ -556,7 +559,7 @@ impl TransportCrypto {
         }
 
         packet.extend_from_slice(&params.nonce_suffix);
-        Ok(())
+        Ok(rtp)
     }
 }
 
@@ -587,17 +590,18 @@ fn strip_decrypted_rtp_payload(
 pub(crate) fn detect_rtp_codec(
     rtp: &RtpHeader,
     session_description: &SessionDescription,
-) -> std::result::Result<Codec, UnsupportedCodecError> {
-    let codec = session_description
-        .audio_codec
-        .as_deref()
-        .map_or(Ok(Codec::Opus), |codec| {
-            Codec::from_discord_audio_name(codec).ok_or_else(|| {
-                UnsupportedCodecError::UnsupportedAudioCodec {
-                    codec: codec.to_string(),
-                }
-            })
-        })?;
+) -> std::result::Result<MediaCodec, UnsupportedCodecError> {
+    let codec =
+        session_description
+            .audio_codec
+            .as_deref()
+            .map_or(Ok(MediaCodec::Opus), |codec| {
+                MediaCodec::from_discord_audio_name(codec).ok_or_else(|| {
+                    UnsupportedCodecError::UnsupportedAudioCodec {
+                        codec: codec.to_string(),
+                    }
+                })
+            })?;
     let expected_payload_type = codec.default_discord_payload_type();
     if rtp.payload_type != expected_payload_type {
         return Err(UnsupportedCodecError::UnsupportedRtpPayloadType {
@@ -721,11 +725,24 @@ pub(crate) fn write_rtp_header(
     timestamp: u32,
     ssrc: u32,
     payload_type: u8,
-) {
-    packet.extend_from_slice(&[RTP_VERSION << 6, payload_type & 0x7f]);
+) -> RtpHeader {
+    let payload_type = payload_type & 0x7f;
+    packet.extend_from_slice(&[RTP_VERSION << 6, payload_type]);
     packet.extend_from_slice(&seq.to_be_bytes());
     packet.extend_from_slice(&timestamp.to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
+    RtpHeader {
+        version: RTP_VERSION,
+        padding: false,
+        extension: false,
+        marker: false,
+        payload_type,
+        seq,
+        timestamp,
+        ssrc,
+        header_len: 12,
+        encrypted_body_offset: 12,
+    }
 }
 
 pub(crate) fn timestamp_increment(sample_rate: u32, duration: Duration) -> u32 {

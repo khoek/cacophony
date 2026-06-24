@@ -12,7 +12,9 @@ use crate::{
     errors::{BackpressureError, Error, Result},
     gateway::{GatewayCommand, SpeakingCommand, SpeakingFlags},
     media::{OutboundPacket, RtpPayload},
-    opus::{Codec, discord::Packet},
+    opus::{PayloadCodec, discord::Packet},
+    queue::DriverReply,
+    stats::DurationStats,
 };
 
 use super::{ConnectionClose, driver::ConnectionDriver};
@@ -74,7 +76,7 @@ impl OpusPlayout {
 
     pub async fn push_payload_owned<P>(&self, payload: P) -> Result<()>
     where
-        P: RtpPayload<Codec = Codec>,
+        P: RtpPayload<Codec = PayloadCodec>,
     {
         let duration = payload.duration();
         self.push_bytes_owned(payload.into_bytes(), duration).await
@@ -100,7 +102,7 @@ impl OpusPlayout {
 
     pub fn try_push_payload_owned<P>(&self, payload: P) -> Result<()>
     where
-        P: RtpPayload<Codec = Codec>,
+        P: RtpPayload<Codec = PayloadCodec>,
     {
         let duration = payload.duration();
         self.try_push_bytes_owned(payload.into_bytes(), duration)
@@ -135,7 +137,7 @@ impl OpusPlayout {
         self.media_tx
             .send(PlayoutCommand::Finish {
                 id: self.id,
-                response,
+                response: DriverReply::new(response),
             })
             .await
             .map_err(|_| Error::Closed)?;
@@ -155,7 +157,7 @@ impl Drop for OpusPlayout {
 
 pub(crate) enum PlayoutCommand {
     Start {
-        response: oneshot::Sender<Result<u64>>,
+        response: DriverReply<u64>,
     },
     Frame {
         id: u64,
@@ -163,7 +165,7 @@ pub(crate) enum PlayoutCommand {
     },
     Finish {
         id: u64,
-        response: oneshot::Sender<Result<OpusPlayoutStats>>,
+        response: DriverReply<OpusPlayoutStats>,
     },
     Cancel {
         id: u64,
@@ -174,10 +176,10 @@ impl PlayoutCommand {
     pub(crate) fn complete_closed(self) {
         match self {
             Self::Start { response } => {
-                let _ = response.send(Err(Error::Closed));
+                response.complete_closed();
             }
             Self::Finish { response, .. } => {
-                let _ = response.send(Err(Error::Closed));
+                response.complete_closed();
             }
             Self::Frame { .. } | Self::Cancel { .. } => {}
         }
@@ -195,7 +197,7 @@ pub(super) struct ActiveOpusPlayout {
     pub(super) frames: VecDeque<PlayoutFrame>,
     pub(super) next_send_at: Option<Instant>,
     pub(super) media_ready_deadline: Option<Instant>,
-    pub(super) finish_response: Option<oneshot::Sender<Result<OpusPlayoutStats>>>,
+    pub(super) finish_response: Option<DriverReply<OpusPlayoutStats>>,
     pub(super) speaking: bool,
     pub(super) stats: ActiveOpusPlayoutStats,
 }
@@ -232,13 +234,13 @@ impl ActiveOpusPlayout {
         self.frames.push_back(frame);
     }
 
-    pub(super) fn finish(&mut self, response: oneshot::Sender<Result<OpusPlayoutStats>>) {
+    pub(super) fn finish(&mut self, response: DriverReply<OpusPlayoutStats>) {
         self.finish_response = Some(response);
     }
 
     pub(super) fn cancel(mut self) {
         if let Some(response) = self.finish_response.take() {
-            let _ = response.send(Err(Error::Closed));
+            response.complete_closed();
         }
     }
 
@@ -279,16 +281,16 @@ pub(super) struct ActiveOpusPlayoutStats {
     first_packet_sent_at: Option<StdInstant>,
     first_packet_sent_after_start: Option<Duration>,
     expected_media: Duration,
-    send_call: TimingSamples,
-    inter_frame_gap: TimingSamples,
-    scheduler_lateness: TimingSamples,
+    send_call: DurationStats,
+    inter_frame_gap: DurationStats,
+    scheduler_lateness: DurationStats,
     late_wakes_over_5ms: usize,
     late_wakes_over_20ms: usize,
     pub(super) underflows: usize,
-    pub(super) underflow_wait: TimingSamples,
+    pub(super) underflow_wait: DurationStats,
     pub(super) dropped_stale_frames: usize,
     clock_rebases: usize,
-    clock_rebase_wait: TimingSamples,
+    clock_rebase_wait: DurationStats,
     last_send_started_at: Option<Instant>,
     dave_enabled: bool,
 }
@@ -359,44 +361,6 @@ impl ActiveOpusPlayoutStats {
     }
 }
 
-#[derive(Default)]
-pub(super) struct TimingSamples {
-    values: Vec<Duration>,
-}
-
-impl TimingSamples {
-    pub(super) fn observe(&mut self, value: Duration) {
-        self.values.push(value);
-    }
-
-    fn finish(mut self) -> DurationDistribution {
-        if self.values.is_empty() {
-            return DurationDistribution::default();
-        }
-        let total = self
-            .values
-            .iter()
-            .fold(Duration::ZERO, |total, value| total + *value);
-        self.values.sort_unstable();
-        let p95_index = (self.values.len() * 95).div_ceil(100).saturating_sub(1);
-        DurationDistribution {
-            count: self.values.len(),
-            min: self.values.first().copied(),
-            avg: Some(duration_div(total, self.values.len())),
-            p95: Some(self.values[p95_index]),
-            max: self.values.last().copied(),
-        }
-    }
-}
-
-fn duration_div(duration: Duration, divisor: usize) -> Duration {
-    if divisor == 0 {
-        return Duration::ZERO;
-    }
-    let nanos = duration.as_nanos() / divisor as u128;
-    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
-}
-
 impl<O, Raw> ConnectionDriver<O, Raw>
 where
     O: crate::observer::ConnectionObserver,
@@ -410,7 +374,7 @@ where
         match command {
             PlayoutCommand::Start { response } => {
                 if self.send.active_playout.is_some() {
-                    let _ = response.send(Err(Error::Backpressure(
+                    response.complete(Err(Error::Backpressure(
                         BackpressureError::ActiveOpusPlayout,
                     )));
                     return Ok(());
@@ -419,7 +383,7 @@ where
                 self.send.next_playout_id = self.send.next_playout_id.wrapping_add(1).max(1);
                 self.send.active_playout =
                     Some(ActiveOpusPlayout::new(id, self.dave_send_active()));
-                let _ = response.send(Ok(id));
+                response.complete(Ok(id));
             }
             PlayoutCommand::Frame { id, frame } => {
                 if let Some(playout) = self
@@ -440,7 +404,7 @@ where
                 {
                     playout.finish(response);
                 } else {
-                    let _ = response.send(Err(Error::Closed));
+                    response.complete_closed();
                 }
             }
             PlayoutCommand::Cancel { id } => {
@@ -558,7 +522,7 @@ where
             playout.speaking = false;
         }
         if let Some(response) = playout.finish_response.take() {
-            let _ = response.send(Ok(playout.stats()));
+            response.complete(Ok(playout.stats()));
         }
         Ok(())
     }
@@ -569,7 +533,7 @@ where
             playout.speaking = false;
         }
         if let Some(response) = playout.finish_response.take() {
-            let _ = response.send(Err(error));
+            response.complete(Err(error));
         }
         Ok(())
     }

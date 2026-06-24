@@ -4,7 +4,9 @@ use std::{
     marker::PhantomData,
 };
 
-use tokio::time::Instant;
+use tokio::{sync::oneshot, time::Instant};
+
+use crate::errors::{Error, Result};
 
 pub(crate) struct BoundedDeque<T> {
     items: VecDeque<T>,
@@ -21,6 +23,16 @@ impl<T> BoundedDeque<T> {
 
     pub(crate) fn pop_front(&mut self) -> Option<T> {
         self.items.pop_front()
+    }
+
+    pub(crate) fn push_front(&mut self, item: T) -> Option<T> {
+        let dropped = if self.items.len() >= self.capacity {
+            self.items.pop_back()
+        } else {
+            None
+        };
+        self.items.push_front(item);
+        dropped
     }
 
     pub(crate) fn push_back(&mut self, item: T) -> Option<T> {
@@ -112,118 +124,117 @@ where
     }
 }
 
-pub(crate) trait PendingRequest {
-    type Key: Copy + Eq + Hash;
-
-    fn key(&self) -> Self::Key;
-    fn deadline(&self) -> Option<Instant>;
-    fn is_closed(&self) -> bool;
-    fn complete_timeout(self);
-    fn complete_closed(self);
+pub(crate) struct DriverReply<T> {
+    response: oneshot::Sender<Result<T>>,
 }
 
-pub(crate) struct PendingRequestQueue<T>
+impl<T> DriverReply<T> {
+    pub(crate) fn new(response: oneshot::Sender<Result<T>>) -> Self {
+        Self { response }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.response.is_closed()
+    }
+
+    pub(crate) fn complete(self, result: Result<T>) {
+        let _ = self.response.send(result);
+    }
+
+    pub(crate) fn complete_closed(self) {
+        self.complete(Err(Error::Closed));
+    }
+}
+
+struct DeadlineValue<T> {
+    deadline: Instant,
+    value: T,
+}
+
+pub(crate) struct BucketDeadlineQueue<B, T, const N: usize>
 where
-    T: PendingRequest,
+    B: QueueBucket + Clone + Eq + Hash,
 {
-    order: VecDeque<T::Key>,
-    requests: HashMap<T::Key, T>,
-    deadlines: DeadlineSet<T::Key>,
+    buckets: BucketQueue<B, DeadlineValue<T>, N>,
+    deadlines: DeadlineSet<B>,
 }
 
-impl<T> Default for PendingRequestQueue<T>
+impl<B, T, const N: usize> Default for BucketDeadlineQueue<B, T, N>
 where
-    T: PendingRequest,
+    B: QueueBucket + Clone + Eq + Hash,
 {
     fn default() -> Self {
         Self {
-            order: VecDeque::new(),
-            requests: HashMap::new(),
+            buckets: BucketQueue::default(),
             deadlines: DeadlineSet::default(),
         }
     }
 }
 
-impl<T> PendingRequestQueue<T>
+impl<B, T, const N: usize> BucketDeadlineQueue<B, T, N>
 where
-    T: PendingRequest,
+    B: QueueBucket + Clone + Eq + Hash,
 {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+    pub(crate) fn len(&self) -> usize {
+        self.buckets.len()
     }
 
-    pub(crate) fn push_back(&mut self, request: T) {
-        self.push(request, false);
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.buckets.iter().map(|item| &item.value)
     }
 
-    pub(crate) fn push_front(&mut self, request: T) {
-        self.push(request, true);
-    }
-
-    pub(crate) fn pop_front(&mut self) -> Option<T> {
-        while let Some(key) = self.order.pop_front() {
-            let Some(request) = self.requests.remove(&key) else {
-                continue;
-            };
-            self.deadlines.remove(&key);
-            if !request.is_closed() {
-                return Some(request);
-            }
+    pub(crate) fn push(&mut self, bucket: B, value: T, deadline: Instant) {
+        if self
+            .buckets
+            .back(bucket)
+            .is_none_or(|queued| queued.deadline <= deadline)
+        {
+            self.buckets
+                .push_back(bucket, DeadlineValue { deadline, value });
+        } else {
+            let index = self
+                .buckets
+                .position(bucket, |queued| queued.deadline > deadline)
+                .expect("out-of-order queue insertion checked");
+            self.buckets
+                .insert(bucket, index, DeadlineValue { deadline, value });
         }
-        None
+        self.refresh_bucket_deadline(bucket);
     }
 
-    pub(crate) fn discard_closed(&mut self) {
-        let deadlines = &mut self.deadlines;
-        self.requests.retain(|key, request| {
-            if request.is_closed() {
-                deadlines.remove(key);
-                false
-            } else {
-                true
-            }
-        });
-        let requests = &self.requests;
-        self.order.retain(|key| requests.contains_key(key));
+    pub(crate) fn pop_expired(&mut self, now: Instant) -> Option<T> {
+        let bucket = self.deadlines.pop_expired(now)?;
+        self.pop_bucket_front(bucket)
     }
 
-    pub(crate) fn complete_expired(&mut self, now: Instant) {
-        while let Some(key) = self.deadlines.pop_expired(now) {
-            if let Some(request) = self.requests.remove(&key)
-                && !request.is_closed()
-            {
-                request.complete_timeout();
-            }
-        }
-    }
-
-    pub(crate) fn complete_closed(&mut self) {
-        for (_, request) in std::mem::take(&mut self.requests) {
-            request.complete_closed();
-        }
-        self.order.clear();
-        self.deadlines.clear();
+    pub(crate) fn pop_matching(&mut self, include: impl FnMut(&B) -> bool) -> Option<T> {
+        let bucket = self.deadlines.first_matching(include)?;
+        self.pop_bucket_front(bucket)
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.deadlines.next_deadline()
     }
 
-    fn push(&mut self, request: T, front: bool) {
-        if request.is_closed() {
-            return;
-        }
-        let key = request.key();
-        if let Some(deadline) = request.deadline() {
-            self.deadlines.insert(key, deadline);
-        }
-        if front {
-            self.order.push_front(key);
+    pub(crate) fn retain(&mut self, bucket: B, keep: impl FnMut(&T) -> bool) {
+        let mut keep = keep;
+        self.buckets.retain(bucket, |item| keep(&item.value));
+        self.refresh_bucket_deadline(bucket);
+    }
+
+    fn pop_bucket_front(&mut self, bucket: B) -> Option<T> {
+        let item = self.buckets.pop_front(bucket)?;
+        self.refresh_bucket_deadline(bucket);
+        Some(item.value)
+    }
+
+    fn refresh_bucket_deadline(&mut self, bucket: B) {
+        if let Some(front) = self.buckets.front(bucket) {
+            self.deadlines.insert(bucket, front.deadline);
         } else {
-            self.order.push_back(key);
+            self.deadlines.remove(&bucket);
         }
-        let old = self.requests.insert(key, request);
-        debug_assert!(old.is_none(), "pending request keys are unique");
     }
 }
 
@@ -347,9 +358,10 @@ where
         Some(key)
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.keys.clear();
-        self.deadlines.clear();
+    pub(crate) fn first_matching(&self, mut include: impl FnMut(&K) -> bool) -> Option<K> {
+        self.deadlines
+            .values()
+            .find_map(|keys| keys.iter().find(|key| include(key)).cloned())
     }
 
     fn remove_from_deadline(&mut self, key: &K, deadline: Instant) {

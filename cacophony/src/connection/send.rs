@@ -3,18 +3,19 @@ use std::time::Duration;
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
+    buffer::ReusableBuffer,
     errors::{Error, Result},
     media::{OutboundPacket, OutboundRtpState},
     observer::UdpPacketSentEvent,
-    opus::Codec,
+    opus::PayloadCodec,
 };
 
 use super::{driver::ConnectionDriver, playout::ActiveOpusPlayout, wait_for_close};
 
 pub(super) struct SendPipeline {
-    pub(super) outbound_rtp: OutboundRtpState<Codec>,
-    pub(super) dave_payload_buffer: Vec<u8>,
-    pub(super) packet_buffer: Vec<u8>,
+    pub(super) outbound_rtp: OutboundRtpState<PayloadCodec>,
+    pub(super) dave_payload_buffer: ReusableBuffer,
+    pub(super) packet_buffer: ReusableBuffer,
     pub(super) active_playout: Option<ActiveOpusPlayout>,
     pub(super) next_playout_id: u64,
 }
@@ -23,8 +24,8 @@ impl SendPipeline {
     pub(super) fn new(ssrc: u32) -> Self {
         Self {
             outbound_rtp: OutboundRtpState::new(ssrc),
-            dave_payload_buffer: Vec::new(),
-            packet_buffer: Vec::new(),
+            dave_payload_buffer: ReusableBuffer::new(),
+            packet_buffer: ReusableBuffer::new(),
             active_playout: None,
             next_playout_id: 1,
         }
@@ -46,10 +47,10 @@ where
         let connection = self.state.internal().config.public_info();
         self.send.dave_payload_buffer.clear();
         let opus_payload = if requires_dave {
-            match self
-                .dave
-                .encrypt_discord_voice_frame_into(&frame, &mut self.send.dave_payload_buffer)?
-            {
+            match self.dave.encrypt_media_frame_into::<PayloadCodec>(
+                &frame,
+                self.send.dave_payload_buffer.as_vec_mut(),
+            )? {
                 ::dave::FrameEncryptResult::Unchanged => frame.as_slice(),
                 ::dave::FrameEncryptResult::Encrypted => self.send.dave_payload_buffer.as_slice(),
             }
@@ -62,12 +63,12 @@ where
             opus_payload,
             duration,
             &self.transport_crypto,
-            &mut self.send.packet_buffer,
+            self.send.packet_buffer.as_vec_mut(),
         )?;
         let build_elapsed = build_started.map(|started| started.elapsed());
         let send_started = O::ENABLE_TIMING.then(Instant::now);
         tokio::select! {
-            sent = self.udp_socket.send(&self.send.packet_buffer) => {
+            sent = self.udp_socket.send(self.send.packet_buffer.as_slice()) => {
                 sent?;
             }
             () = wait_for_close(close_rx) => return Err(Error::Closed),

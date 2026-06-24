@@ -9,8 +9,8 @@ use tokio::time::Instant;
 use crate::{
     errors::{Error, InvalidInputError, OpusError, OpusOperation, Result},
     media::{
-        Codec as MediaCodec, DecodedFrame, DecodedFrameMetadata, FrameRaw, ReceivedFrame,
-        RtpPayloadCodec,
+        DecodedFrame, DecodedFrameMetadata, EncryptedMediaCodec, FrameRaw, MediaCodec,
+        ReceivedFrame, RtpPayloadCodec,
     },
     observer::DavePendingMediaReason,
     pcm::PcmChunk,
@@ -25,12 +25,16 @@ const OGG_OPUS_ARCHIVE_SERIAL: u32 = 0xDEADBEEF;
 const OGG_OPUS_ARCHIVE_BITRATE_BPS: i32 = 24_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Codec;
+pub struct PayloadCodec;
 
-impl RtpPayloadCodec for Codec {
+impl RtpPayloadCodec for PayloadCodec {
     const CODEC: MediaCodec = MediaCodec::Opus;
     const DISCORD_PAYLOAD_TYPE: u8 = discord::RTP_PAYLOAD_TYPE;
     const SAMPLE_RATE_HZ: u32 = discord::SAMPLE_RATE_HZ;
+}
+
+impl EncryptedMediaCodec for PayloadCodec {
+    type DaveCodec = dave::Opus;
 }
 
 pub struct CapturedPcmAudio {
@@ -204,7 +208,7 @@ pub mod discord {
     };
     use opus_rs::{Application as RawOpusApplication, OpusEncoder as RawOpusEncoder};
 
-    use super::{Codec, MILLISECONDS_PER_SECOND};
+    use super::{MILLISECONDS_PER_SECOND, PayloadCodec};
 
     pub const SAMPLE_RATE_HZ: u32 = 48_000;
     pub const CHANNELS: usize = 2;
@@ -223,7 +227,7 @@ pub mod discord {
     }
 
     impl RtpPayload for Packet {
-        type Codec = Codec;
+        type Codec = PayloadCodec;
 
         fn bytes(&self) -> &[u8] {
             &self.bytes
@@ -287,7 +291,7 @@ pub mod discord {
     }
 
     impl RtpPayload for PacketRef<'_> {
-        type Codec = Codec;
+        type Codec = PayloadCodec;
 
         fn bytes(&self) -> &[u8] {
             self.bytes
@@ -957,6 +961,21 @@ pub mod discord {
         StereoALaw(PcmEncoder<ALaw, StereoInterleaved>),
     }
 
+    macro_rules! with_dynamic_pcm_encoder {
+        ($encoder:expr, $binding:ident => $body:expr) => {
+            match $encoder {
+                DynamicPcmEncoderInner::MonoF32Le($binding) => $body,
+                DynamicPcmEncoderInner::MonoS16Le($binding) => $body,
+                DynamicPcmEncoderInner::MonoMuLaw($binding) => $body,
+                DynamicPcmEncoderInner::MonoALaw($binding) => $body,
+                DynamicPcmEncoderInner::StereoF32Le($binding) => $body,
+                DynamicPcmEncoderInner::StereoS16Le($binding) => $body,
+                DynamicPcmEncoderInner::StereoMuLaw($binding) => $body,
+                DynamicPcmEncoderInner::StereoALaw($binding) => $body,
+            }
+        };
+    }
+
     impl DynamicPcmEncoderInner {
         fn new(
             sample_rate_hz: NonZeroU32,
@@ -1005,42 +1024,15 @@ pub mod discord {
         }
 
         fn push(&mut self, data: &[u8], sink: &mut impl PacketSink) -> Result<usize> {
-            match self {
-                Self::MonoF32Le(encoder) => encoder.push_to(data, sink),
-                Self::MonoS16Le(encoder) => encoder.push_to(data, sink),
-                Self::MonoMuLaw(encoder) => encoder.push_to(data, sink),
-                Self::MonoALaw(encoder) => encoder.push_to(data, sink),
-                Self::StereoF32Le(encoder) => encoder.push_to(data, sink),
-                Self::StereoS16Le(encoder) => encoder.push_to(data, sink),
-                Self::StereoMuLaw(encoder) => encoder.push_to(data, sink),
-                Self::StereoALaw(encoder) => encoder.push_to(data, sink),
-            }
+            with_dynamic_pcm_encoder!(self, encoder => encoder.push_to(data, sink))
         }
 
         fn finish(&mut self, sink: &mut impl PacketSink) -> Result<usize> {
-            match self {
-                Self::MonoF32Le(encoder) => encoder.finish_to(sink),
-                Self::MonoS16Le(encoder) => encoder.finish_to(sink),
-                Self::MonoMuLaw(encoder) => encoder.finish_to(sink),
-                Self::MonoALaw(encoder) => encoder.finish_to(sink),
-                Self::StereoF32Le(encoder) => encoder.finish_to(sink),
-                Self::StereoS16Le(encoder) => encoder.finish_to(sink),
-                Self::StereoMuLaw(encoder) => encoder.finish_to(sink),
-                Self::StereoALaw(encoder) => encoder.finish_to(sink),
-            }
+            with_dynamic_pcm_encoder!(self, encoder => encoder.finish_to(sink))
         }
 
         fn resampling_required(&self) -> bool {
-            match self {
-                Self::MonoF32Le(encoder) => encoder.resampling_required(),
-                Self::MonoS16Le(encoder) => encoder.resampling_required(),
-                Self::MonoMuLaw(encoder) => encoder.resampling_required(),
-                Self::MonoALaw(encoder) => encoder.resampling_required(),
-                Self::StereoF32Le(encoder) => encoder.resampling_required(),
-                Self::StereoS16Le(encoder) => encoder.resampling_required(),
-                Self::StereoMuLaw(encoder) => encoder.resampling_required(),
-                Self::StereoALaw(encoder) => encoder.resampling_required(),
-            }
+            with_dynamic_pcm_encoder!(self, encoder => encoder.resampling_required())
         }
     }
 
@@ -1253,7 +1245,7 @@ where
         packet: PendingMediaPacket<Raw>,
     ) -> Option<PendingMediaFrame<Raw>> {
         Some(PendingMediaFrame {
-            raw: Raw::from_rtp_packet::<Codec>(packet.raw),
+            raw: Raw::from_rtp_packet::<PayloadCodec>(packet.raw),
             rtp: packet.rtp,
             user_id: packet.user_id,
             codec: packet.codec,

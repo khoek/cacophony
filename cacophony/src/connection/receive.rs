@@ -1,9 +1,10 @@
-use std::{collections::HashSet, time::Duration};
+use std::collections::HashSet;
 
 use dave::MediaType;
-use tokio::{sync::oneshot, time::Instant};
+use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
+    buffer::ReusableBuffer,
     dave::{
         dave_decrypt_failure_should_retry, dave_gateway_media_ready, dave_receive_transform_active,
         dave_transition_zero_media_ready,
@@ -17,7 +18,8 @@ use crate::{
         ReceiveDecodeStage, ReceiveFrameDropReason, ReceiveFrameDroppedEvent, RtcpPacketEvent,
         observe_receive_decode_error,
     },
-    queue::{BoundedDeque, BucketQueue, PendingRequest, PendingRequestQueue, QueueBucket},
+    opus::PayloadCodec,
+    queue::{BoundedDeque, BucketQueue, DriverReply, QueueBucket},
     state::{
         ConnectionTuning, DavePendingMediaRetry, PendingMediaFrame, PendingMediaPacket,
         ReceiveState,
@@ -61,11 +63,8 @@ impl QueueBucket for LowLevelReceiveKind {
 }
 
 pub(crate) struct PendingReceive<T> {
-    pub(crate) id: u64,
     pub(crate) max_len: usize,
-    pub(crate) deadline: Option<Instant>,
-    pub(crate) max_wait: Option<Duration>,
-    pub(crate) response: oneshot::Sender<Result<T>>,
+    pub(crate) response: DriverReply<T>,
 }
 
 impl<T> PendingReceive<T> {
@@ -73,49 +72,12 @@ impl<T> PendingReceive<T> {
         self.response.is_closed()
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_expired(&self, now: Instant) -> bool {
-        self.deadline.is_some_and(|deadline| now >= deadline)
-    }
-
     pub(crate) fn complete(self, result: Result<T>) {
-        let _ = self.response.send(result);
+        self.response.complete(result);
     }
 
-    #[cfg(test)]
-    pub(crate) fn complete_timeout(self) {
-        <Self as PendingRequest>::complete_timeout(self);
-    }
-}
-
-impl<T> PendingRequest for PendingReceive<T> {
-    type Key = u64;
-
-    fn key(&self) -> Self::Key {
-        self.id
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-
-    fn is_closed(&self) -> bool {
-        self.is_closed()
-    }
-
-    fn complete_timeout(self) {
-        if let Some(duration) = self.max_wait {
-            let _ = self.response.send(Err(Error::Timeout {
-                stage: None,
-                duration,
-            }));
-        } else {
-            let _ = self.response.send(Err(Error::Closed));
-        }
-    }
-
-    fn complete_closed(self) {
-        let _ = self.response.send(Err(Error::Closed));
+    pub(crate) fn complete_closed(self) {
+        self.response.complete_closed();
     }
 }
 
@@ -150,6 +112,16 @@ where
 
     pub(crate) fn pop_front(&mut self) -> Option<FrameReceiveResult<Raw>> {
         self.frames.pop_front()
+    }
+
+    pub(crate) fn push_front<O>(&mut self, observer: &O, result: FrameReceiveResult<Raw>)
+    where
+        O: ConnectionObserver,
+    {
+        let queued_before = self.frames.len();
+        if let Some(dropped) = self.frames.push_front(result) {
+            Self::observe_dropped(observer, &dropped, queued_before.saturating_sub(1));
+        }
     }
 
     #[cfg(test)]
@@ -214,13 +186,12 @@ where
     Raw: FrameRaw,
 {
     pub(super) state: ReceiveState<Raw>,
-    pub(super) udp_buffer: Vec<u8>,
-    pub(super) payload_buffer: Vec<u8>,
+    pub(super) udp_buffer: ReusableBuffer,
+    pub(super) payload_buffer: ReusableBuffer,
     pub(super) ready_frames: ReadyFrameQueue<Raw>,
-    pub(super) pending_frame_receives: PendingRequestQueue<PendingReceive<ReceivedFrame<Raw>>>,
+    pub(super) frame_stream: Option<mpsc::Sender<FrameReceiveResult<Raw>>>,
     pending_packet_receives:
         BucketQueue<LowLevelReceiveKind, PendingPacketReceive, { LowLevelReceiveKind::COUNT }>,
-    next_receive_id: u64,
 }
 
 impl<Raw> ReceivePipeline<Raw>
@@ -230,19 +201,12 @@ where
     pub(super) fn new(tuning: ConnectionTuning) -> Self {
         Self {
             state: ReceiveState::new(tuning),
-            udp_buffer: Vec::new(),
-            payload_buffer: Vec::new(),
+            udp_buffer: ReusableBuffer::new(),
+            payload_buffer: ReusableBuffer::new(),
             ready_frames: ReadyFrameQueue::new(tuning.ready_frame_buffer_max),
-            pending_frame_receives: PendingRequestQueue::default(),
+            frame_stream: None,
             pending_packet_receives: BucketQueue::default(),
-            next_receive_id: 1,
         }
-    }
-
-    pub(super) fn next_receive_id(&mut self) -> u64 {
-        let id = self.next_receive_id;
-        self.next_receive_id = self.next_receive_id.wrapping_add(1).max(1);
-        id
     }
 
     pub(super) fn push_packet_receive(
@@ -270,21 +234,42 @@ where
     pub(super) fn complete_closed_packet_receives(&mut self) {
         for kind in LowLevelReceiveKind::ALL {
             while let Some(receive) = self.pending_packet_receives.pop_front(kind) {
-                <PendingPacketReceive as PendingRequest>::complete_closed(receive);
+                receive.complete_closed();
             }
+        }
+    }
+
+    pub(super) fn attach_frame_stream(
+        &mut self,
+        frames: mpsc::Sender<FrameReceiveResult<Raw>>,
+    ) -> Result<()> {
+        self.discard_closed_frame_stream();
+        if self.frame_stream.is_some() {
+            return Err(Error::Backpressure(
+                crate::errors::BackpressureError::ActiveFrameStream,
+            ));
+        }
+        self.frame_stream = Some(frames);
+        Ok(())
+    }
+
+    pub(super) fn discard_closed_frame_stream(&mut self) {
+        if self
+            .frame_stream
+            .as_ref()
+            .is_some_and(mpsc::Sender::is_closed)
+        {
+            self.frame_stream = None;
         }
     }
 }
 
-pub(super) fn take_receive_payload_buffer(buffer: &mut Vec<u8>) -> Vec<u8> {
-    std::mem::take(buffer)
+pub(super) fn take_receive_payload_buffer(buffer: &mut ReusableBuffer) -> Vec<u8> {
+    buffer.take()
 }
 
-pub(super) fn recycle_receive_payload_buffer(buffer: &mut Vec<u8>, mut payload: Vec<u8>) {
-    payload.clear();
-    if payload.capacity() > buffer.capacity() {
-        *buffer = payload;
-    }
+pub(super) fn recycle_receive_payload_buffer(buffer: &mut ReusableBuffer, payload: Vec<u8>) {
+    buffer.recycle_largest(payload);
 }
 
 pub(crate) fn limit_raw_packet_result(
@@ -328,27 +313,32 @@ where
     O: crate::observer::ConnectionObserver,
     Raw: crate::media::FrameRaw,
 {
-    pub(super) fn resolve_pending_receives(&mut self) {
-        loop {
-            self.receive.pending_frame_receives.discard_closed();
-            if self.receive.pending_frame_receives.is_empty() {
-                return;
-            }
-            let Some(receive) = self.receive.pending_frame_receives.pop_front() else {
+    pub(super) fn flush_frame_stream(&mut self) {
+        self.receive.discard_closed_frame_stream();
+        while self
+            .receive
+            .frame_stream
+            .as_ref()
+            .is_some_and(|frames| frames.capacity() > 0)
+        {
+            let Some(result) = self.receive.ready_frames.pop_front() else {
                 return;
             };
-            let result = match self.receive.ready_frames.pop_front() {
-                Some(result) => result,
-                None => {
-                    let Some(result) = self.drain_ready_voice_frame() else {
-                        self.receive.pending_frame_receives.push_front(receive);
-                        return;
-                    };
-                    result
+            let Some(frames) = self.receive.frame_stream.as_ref() else {
+                self.receive.ready_frames.push_front(&self.observer, result);
+                return;
+            };
+            match frames.try_send(result) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(result)) => {
+                    self.receive.ready_frames.push_front(&self.observer, result);
+                    return;
                 }
-            };
-            let max_len = receive.max_len;
-            receive.complete(limit_voice_frame_result(result, max_len));
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.receive.frame_stream = None;
+                    return;
+                }
+            }
         }
     }
 
@@ -366,14 +356,13 @@ where
     }
 
     pub(super) fn discard_inactive_pending_receives(&mut self) {
-        let now = Instant::now();
+        self.receive.discard_closed_frame_stream();
         self.receive.discard_closed_packet_receives();
-        self.receive.pending_frame_receives.complete_expired(now);
-        self.receive.pending_frame_receives.discard_closed();
     }
 
     pub(super) fn handle_received_udp_packet(&mut self, len: usize) {
-        let info = RawUdpPacketInfo::from_bytes(&self.receive.udp_buffer[..len]);
+        let bytes = &self.receive.udp_buffer.as_slice()[..len];
+        let info = RawUdpPacketInfo::from_bytes(bytes);
         self.resolve_pending_low_level_receives(info, len);
         if info.is_rtcp() {
             self.observe_rtcp_packet(info, len);
@@ -383,7 +372,7 @@ where
             self.queue_ready_voice_frame(result);
         }
         self.collect_ready_voice_frames();
-        self.resolve_pending_receives();
+        self.flush_frame_stream();
     }
 
     fn resolve_pending_low_level_receives(&mut self, info: RawUdpPacketInfo, len: usize) {
@@ -404,8 +393,9 @@ where
             return;
         };
         let max_len = receive.max_len;
+        let bytes = &self.receive.udp_buffer.as_slice()[..len];
         receive.complete(limit_raw_packet_result(
-            info.into_raw_packet(&self.receive.udp_buffer[..len]),
+            info.into_raw_packet(bytes),
             max_len,
             kind.payload_kind(),
         ));
@@ -416,7 +406,8 @@ where
         info: RawUdpPacketInfo,
         len: usize,
     ) -> Option<FrameReceiveResult<Raw>> {
-        let rtp = match parse_rtp_header(&self.receive.udp_buffer[..len]) {
+        let packet_bytes = &self.receive.udp_buffer.as_slice()[..len];
+        let rtp = match parse_rtp_header(packet_bytes) {
             Ok(rtp) => rtp,
             Err(error) => {
                 self.observe_decode_error(
@@ -458,11 +449,10 @@ where
             (user_id, codec, dave_receive_transform_active(&state.dave))
         };
         self.receive.payload_buffer.clear();
-        let packet_bytes = &self.receive.udp_buffer[..len];
         if let Err(error) = self.transport_crypto.decrypt_payload_into(
             packet_bytes,
             &rtp,
-            &mut self.receive.payload_buffer,
+            self.receive.payload_buffer.as_vec_mut(),
         ) {
             self.observe_decode_error(
                 ReceiveDecodeStage::Transport,
@@ -533,12 +523,11 @@ where
     }
 
     pub(super) fn expire_pending_dave_media(&mut self) {
-        let ttl = self.state.internal().config.tuning.dave_pending_media_ttl;
         while let Some(media) = self
             .receive
             .state
             .pending_dave_media
-            .pop_expired(Instant::now(), ttl)
+            .pop_expired(Instant::now())
         {
             self.observe_pending_dave_media(&media, DavePendingMediaReason::Expired, false);
         }
@@ -574,10 +563,10 @@ where
             return None;
         }
         self.receive.payload_buffer.clear();
-        match self.dave.decrypt_discord_voice_frame_into(
+        match self.dave.decrypt_media_frame_into::<PayloadCodec>(
             media.user_id,
             &media.encrypted_frame,
-            &mut self.receive.payload_buffer,
+            self.receive.payload_buffer.as_vec_mut(),
         ) {
             Ok(len) => {
                 if media.was_pending {
@@ -680,7 +669,7 @@ where
         if !O::ENABLE_RTCP {
             return;
         }
-        let bytes = &self.receive.udp_buffer[..len];
+        let bytes = &self.receive.udp_buffer.as_slice()[..len];
         let connection = self.state.internal().config.public_info();
         self.observer.rtcp_packet_received(RtcpPacketEvent {
             endpoint: &connection.endpoint,

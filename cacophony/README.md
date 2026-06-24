@@ -1,26 +1,47 @@
 # cacophony
 
-`cacophony` is a high-performance Discord voice transport for Rust, and is built for applications that want direct control over voice performance. It owns the low-level voice path: Discord voice gateway negotiation, UDP discovery, RTP packet construction, AEAD transport crypto, Opus encode/decode helpers, DAVE MLS coordination, and typed connection-state callbacks. Consumers provide a Discord voice session token/configuration and receive a `Connection` for sending Discord Opus packets through a bounded media sink, receiving decrypted voice frames, and observing voice gateway state.
+High-performance Discord voice runtime for Rust. `cacophony` owns the Discord
+voice transport path: voice gateway negotiation, UDP discovery, RTP send/receive,
+AEAD transport crypto, Opus packet playout, DAVE coordination, and typed
+connection observers.
 
-## Design
+It is designed for applications that need direct control over latency and media
+flow without binding the runtime to a logging, metrics, bot-framework, or audio
+pipeline stack.
 
-- **End-to-end Discord voice transport**: websocket identify/select-protocol, heartbeat handling, UDP discovery, RTP send/receive, Opus voice frame assembly, and speaking state commands.
-- **Modern encryption modes**: `aead_aes256_gcm_rtpsize` first, with `aead_xchacha20_poly1305_rtpsize` support when selected by Discord.
-- **DAVE support**: protocol-version negotiation, prepare-transition, prepare-epoch, external sender, proposals, commit/welcome, transition-ready, currently supported Opus audio encryption/decryption, and reset-aware epoch handling.
-- **Opus utilities**: 48 kHz stereo 20 ms PCM frame validation, CBR Discord Opus encoding with `Application::Audio` by default, and caller-buffer decode helpers.
-- **Modular codec boundary**: codec-neutral RTP/transport code uses `RtpPayloadCodec` and `RtpPayload`; `cacophony::opus` is the only implemented codec module today, and non-Opus Discord media is intentionally unsupported.
-- **Typed observability**: the voice connection emits strongly typed observer callbacks through a generic `ConnectionObserver`; applications can map those events into logs, metrics, traces, or tests without coupling `cacophony` to any tracing backend.
-- **Compile-time receive policy**: normal media receive returns compact frame metadata and bytes; raw UDP/RTP packet retention is selected explicitly with the `FrameRaw` type parameter.
-- **Curated public surface**: high-level connection, media, Opus, DAVE status, and observer types are reexported at the crate root; protocol diagnostics such as raw UDP packet snapshots live under `cacophony::low_level`.
+## Features
 
-## Minimal Use
+- **Discord voice transport**: websocket identify/select-protocol, heartbeat,
+  UDP discovery, RTP packet construction/parsing, speaking state commands, and
+  close-aware async send/receive APIs.
+- **Real-time Opus playout**: bounded driver-owned media sink, clocked 20 ms
+  Discord Opus packet scheduling, stale-frame handling, and playout timing
+  statistics.
+- **Opus utilities**: PCM-to-Discord-Opus streaming/batch encoding, caller-buffer
+  decode helpers, Ogg Opus capture, and explicit 48 kHz stereo frame validation.
+- **DAVE integration**: protocol-version negotiation, MLS external sender,
+  proposals, commit/welcome, transition-ready, staged sender activation, and
+  pending encrypted-media retry.
+- **Typed observability**: `ConnectionObserver` callbacks are generic, typed, and
+  backend-agnostic. Leave them as `NoopConnectionObserver` for zero application
+  telemetry work.
+- **Compile-time raw capture policy**: normal receive returns compact media
+  frames; raw UDP/RTP packet retention is selected explicitly with the `FrameRaw`
+  type parameter.
+- **Curated API boundary**: high-level connection/media types live at the crate
+  root; protocol inspection types are grouped under `cacophony::low_level`.
+
+## Current media support
+
+`cacophony` currently supports Discord Opus voice media. The lower-level `dave`
+crate implements the full DAVE frame transform codec set, but this runtime does
+not yet expose Discord video packetization/depacketization or playout APIs.
+Non-Opus Discord media is rejected explicitly.
+
+## Example
 
 ```rust
-use cacophony::{
-    Result,
-    ConnectionConfig,
-    connect,
-};
+use cacophony::{ConnectionConfig, Result, connect};
 use cacophony::opus::discord::Packet;
 
 # async fn example() -> Result<()> {
@@ -35,25 +56,23 @@ let connection = connect(ConnectionConfig::new(
 
 let playout = connection.start_opus_playout().await?;
 playout.push_packet_owned(Packet {
-    bytes: opus_bytes,
+    bytes: opus_packet,
     duration: std::time::Duration::from_millis(20),
 }).await?;
+
 let stats = playout.finish().await?;
 assert_eq!(stats.packets, 1);
 # Ok(())
 # }
 ```
 
-Use `connect_with_observer` when the application wants typed connection events without pulling logging or telemetry into the crate:
+Use an observer when the application wants typed timing or protocol events
+without wiring tracing into the runtime:
 
 ```rust
 use cacophony::{
-    Result,
-    ConnectionConfig,
-    ConnectionObserver,
-    UdpPacketSentEvent,
-    WebSocketClosedEvent,
-    connect_with_observer,
+    ConnectionConfig, ConnectionObserver, Result, UdpPacketSentEvent,
+    WebSocketClosedEvent, connect_with_observer,
 };
 
 #[derive(Clone)]
@@ -71,33 +90,39 @@ impl ConnectionObserver for Metrics {
     }
 }
 
-# async fn example() -> Result<()> {
+# async fn example(config: ConnectionConfig) -> Result<()> {
 let connection = connect_with_observer(config, Metrics).await?;
 # Ok(())
 # }
 ```
 
-Observer callbacks execute inline on the connection driver task. Keep them O(1), nonblocking, and allocation-light; hand expensive aggregation to application-owned queues or tasks.
+Observer callbacks execute inline on the connection driver task. Keep them O(1),
+nonblocking, and allocation-light; send expensive aggregation to application-owned
+queues or tasks.
 
-Use `connect_with_observer_and_raw` only when diagnostics need raw packet retention on received media frames:
+Raw packet retention is opt-in:
 
 ```rust
-use cacophony::{
-    RawFramePackets,
-    connect_with_observer_and_raw,
-};
+use cacophony::connect_with_observer_and_raw;
+use cacophony::low_level::RawFramePackets;
 
 # async fn example(config: cacophony::ConnectionConfig) -> cacophony::Result<()> {
 let connection = connect_with_observer_and_raw::<_, RawFramePackets>(
     config,
     cacophony::NoopConnectionObserver,
 ).await?;
-let frame = connection.recv_voice_frame(4096).await?;
-eprintln!("captured {} packet(s)", frame.raw.packets.len());
+let mut frames = connection.frame_stream(4096).await?;
+let frame = frames.recv().await?;
+eprintln!("captured {} RTP packet(s)", frame.raw.packets.len());
 # Ok(())
 # }
 ```
 
-## DAVE
+## Related crates
 
-DAVE state is owned by `Connection`. Applications send and receive Opus media through the same media APIs regardless of whether Discord has DAVE enabled; the connection performs MLS coordination, supported Opus audio encryption/decryption, and pending encrypted-media retries internally. The hot send path accepts owned `opus::discord::Packet` values or borrowed packet bytes with explicit duration; payload capture is left to callers that explicitly need it.
+- `dave`: Discord DAVE media-frame transform and MLS ratchet primitives used by
+  `cacophony`.
+
+## License
+
+AGPL-3.0-only. See `LICENSE` for details.

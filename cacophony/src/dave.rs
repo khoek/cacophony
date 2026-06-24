@@ -1,14 +1,14 @@
 use std::{collections::HashSet, num::NonZeroU16, time::Duration};
 
 use dave::{
-    DAVE_PROTOCOL_VERSION, FrameEncryptResult, MediaFrame, MediaType, Opus, ProposalsOperation,
-    Session,
+    DAVE_PROTOCOL_VERSION, FrameCodec, FrameEncryptResult, MediaFrame, ProposalsOperation, Session,
 };
 use serde::Serialize;
 
 use crate::{
     errors::{DaveDecryptError, DaveError, DaveProposalsPayloadError, Error, Result},
     gateway::{DaveInvalidCommitWelcomeCommand, DaveTransitionReadyCommand, GatewayCommand},
+    media::EncryptedMediaCodec,
     observer::{ConnectionObserver, DisplayValue, ReceiveDecodeErrorKind},
     state::{DaveInternalState, DaveMlsState},
 };
@@ -81,26 +81,32 @@ impl DaveCoordinator {
         self.transition_ready
     }
 
-    pub(crate) fn encrypt_discord_voice_frame_into(
+    pub(crate) fn encrypt_media_frame_into<C>(
         &mut self,
         frame: &[u8],
         output: &mut Vec<u8>,
-    ) -> std::result::Result<FrameEncryptResult, DaveError> {
+    ) -> std::result::Result<FrameEncryptResult, DaveError>
+    where
+        C: EncryptedMediaCodec,
+    {
         self.session
-            .encrypt_into(MediaFrame::<Opus>::new(frame), output)
+            .encrypt_into(MediaFrame::<C::DaveCodec>::new(frame), output)
             .map_err(DaveError::Encrypt)
     }
 
-    pub(crate) fn decrypt_discord_voice_frame_into(
+    pub(crate) fn decrypt_media_frame_into<C>(
         &mut self,
         user_id: Option<u64>,
         frame: &[u8],
         output: &mut Vec<u8>,
-    ) -> std::result::Result<usize, DaveDecryptError> {
+    ) -> std::result::Result<usize, DaveDecryptError>
+    where
+        C: EncryptedMediaCodec,
+    {
         self.session
             .decrypt_into(
                 user_id.ok_or(DaveDecryptError::MissingUser)?,
-                MediaType::Audio,
+                C::DaveCodec::MEDIA_TYPE,
                 frame,
                 output,
             )
