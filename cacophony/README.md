@@ -44,26 +44,34 @@ Non-Opus Discord media is rejected explicitly.
 use cacophony::{ConnectionConfig, Result, connect};
 use cacophony::opus::discord::Packet;
 
-# async fn example() -> Result<()> {
-let connection = connect(ConnectionConfig::new(
-    guild_id,
-    channel_id,
-    bot_user_id,
-    session_id,
-    token,
-    endpoint,
-)).await?;
+async fn play_one_packet(
+    guild_id: u64,
+    channel_id: u64,
+    bot_user_id: u64,
+    session_id: String,
+    token: String,
+    endpoint: String,
+    opus_packet: Vec<u8>,
+) -> Result<()> {
+    let connection = connect(ConnectionConfig::new(
+        guild_id,
+        channel_id,
+        bot_user_id,
+        session_id,
+        token,
+        endpoint,
+    )).await?;
 
-let playout = connection.start_opus_playout().await?;
-playout.push_packet_owned(Packet {
-    bytes: opus_packet,
-    duration: std::time::Duration::from_millis(20),
-}).await?;
+    let playout = connection.start_opus_playout().await?;
+    playout.push_packet_owned(Packet {
+        bytes: opus_packet,
+        duration: std::time::Duration::from_millis(20),
+    }).await?;
 
-let stats = playout.finish().await?;
-assert_eq!(stats.packets, 1);
-# Ok(())
-# }
+    let stats = playout.finish().await?;
+    assert_eq!(stats.packets, 1);
+    Ok(())
+}
 ```
 
 Use an observer when the application wants typed timing or protocol events
@@ -90,10 +98,11 @@ impl ConnectionObserver for Metrics {
     }
 }
 
-# async fn example(config: ConnectionConfig) -> Result<()> {
-let connection = connect_with_observer(config, Metrics).await?;
-# Ok(())
-# }
+async fn connect_with_metrics(config: ConnectionConfig) -> Result<()> {
+    let connection = connect_with_observer(config, Metrics).await?;
+    let _ = connection;
+    Ok(())
+}
 ```
 
 Observer callbacks execute inline on the connection driver task. Keep them O(1),
@@ -106,22 +115,24 @@ Raw packet retention is opt-in:
 use cacophony::connect_with_observer_and_raw;
 use cacophony::low_level::RawFramePackets;
 
-# async fn example(config: cacophony::ConnectionConfig) -> cacophony::Result<()> {
-let connection = connect_with_observer_and_raw::<_, RawFramePackets>(
-    config,
-    cacophony::NoopConnectionObserver,
-).await?;
-let mut frames = connection.frame_stream(4096).await?;
-let frame = frames.recv().await?;
-eprintln!("captured {} RTP packet(s)", frame.raw.packets.len());
-# Ok(())
-# }
+async fn receive_with_raw_packets(
+    config: cacophony::ConnectionConfig,
+) -> cacophony::Result<()> {
+    let connection = connect_with_observer_and_raw::<_, RawFramePackets>(
+        config,
+        cacophony::NoopConnectionObserver,
+    ).await?;
+    let mut frames = connection.frame_stream(4096).await?;
+    let frame = frames.recv().await?;
+    eprintln!("captured {} RTP packet(s)", frame.raw.packets.len());
+    Ok(())
+}
 ```
 
 ## Related crates
 
-- `dave`: Discord DAVE media-frame transform and MLS ratchet primitives used by
-  `cacophony`.
+- [`dave`](https://crates.io/crates/dave): Discord DAVE media-frame transform
+  and MLS ratchet primitives used by `cacophony`.
 
 ## License
 

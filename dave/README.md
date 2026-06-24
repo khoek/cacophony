@@ -47,16 +47,10 @@ truncated nonces, and tags before reconstructing the decrypted encoded frame.
 ## Example
 
 ```rust
-use std::num::NonZeroU16;
-
 use dave::{DAVE_PROTOCOL_VERSION, MediaFrame, Opus, Session};
 
 fn new_session(user_id: u64, channel_id: u64) -> Result<Session, dave::InitError> {
-    Session::new(
-        NonZeroU16::new(DAVE_PROTOCOL_VERSION).unwrap(),
-        user_id,
-        channel_id,
-    )
+    Session::new(DAVE_PROTOCOL_VERSION, user_id, channel_id)
 }
 
 fn opus_frame(bytes: &[u8]) -> MediaFrame<'_, Opus> {
@@ -71,7 +65,8 @@ transition points required by the gateway.
 
 ## Related crates
 
-- `cacophony`: high-performance Discord voice runtime built on top of `dave`.
+- [`cacophony`](https://crates.io/crates/cacophony): high-performance Discord
+  voice runtime built on top of `dave`.
 
 ## License
 

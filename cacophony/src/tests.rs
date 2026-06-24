@@ -182,7 +182,7 @@ fn default_config_uses_dave_protocol_version() {
 
     assert_eq!(
         config.max_dave_protocol_version,
-        Some(DAVE_PROTOCOL_VERSION)
+        Some(DAVE_PROTOCOL_VERSION.get())
     );
     assert_eq!(
         config.dave_send_media_ready_timeout,
@@ -249,7 +249,7 @@ async fn send_returns_closed_after_connection_closes() {
 #[tokio::test]
 async fn wait_until_media_ready_returns_closed_after_connection_closes() {
     let mut state = test_state();
-    state.dave.protocol_version = Some(DAVE_PROTOCOL_VERSION);
+    state.dave.protocol_version = Some(DAVE_PROTOCOL_VERSION.get());
     state.dave.passthrough = false;
     let connection = test_connection_with_state(state).await;
 

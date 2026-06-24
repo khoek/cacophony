@@ -5,6 +5,8 @@ mod leb128;
 mod ratchet;
 mod session;
 
+use std::num::NonZeroU16;
+
 pub use error::{
     CreateKeyPackageError, DecryptError, EncryptError, Error, FrameDecryptError, InitError,
     ProcessCommitError, ProcessProposalsError, ProcessWelcomeError, SetExternalSenderError,
@@ -16,4 +18,4 @@ pub use frame::{
 };
 pub use session::{CommitWelcome, FrameEncryptResult, ProposalsOperation, Session, SessionStatus};
 
-pub const DAVE_PROTOCOL_VERSION: u16 = 1;
+pub const DAVE_PROTOCOL_VERSION: NonZeroU16 = NonZeroU16::new(1).unwrap();

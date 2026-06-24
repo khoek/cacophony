@@ -16,18 +16,6 @@ use crate::{
 const DAVE_TRANSITION_PASSTHROUGH_WINDOW: Duration = Duration::from_secs(10);
 const DAVE_RESET_PASSTHROUGH_WINDOW: Duration = Duration::from_secs(120);
 
-fn create_dave_session(
-    protocol_version: u16,
-    user_id: u64,
-    channel_id: u64,
-) -> std::result::Result<Session, DaveError> {
-    let protocol_version =
-        NonZeroU16::new(protocol_version).ok_or(DaveError::InvalidProtocolVersion {
-            version: protocol_version,
-        })?;
-    new_dave_session(protocol_version, user_id, channel_id)
-}
-
 fn new_dave_session(
     protocol_version: NonZeroU16,
     user_id: u64,
@@ -54,7 +42,7 @@ pub(crate) struct DaveCoordinator {
 impl DaveCoordinator {
     pub(crate) fn new(bot_user_id: u64, channel_id: u64) -> Result<Self> {
         Ok(Self {
-            session: create_dave_session(DAVE_PROTOCOL_VERSION, bot_user_id, channel_id)?,
+            session: new_dave_session(DAVE_PROTOCOL_VERSION, bot_user_id, channel_id)?,
             bot_user_id,
             channel_id,
             external_sender_set: false,

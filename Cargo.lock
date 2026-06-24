@@ -158,7 +158,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "cacophony"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -421,7 +421,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "dave"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aead 0.6.1",
  "aes 0.9.1",

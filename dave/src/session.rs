@@ -558,9 +558,10 @@ impl<'a> TypedMediaFrameVisitor<'a> for EncryptTypedFrame<'_, '_> {
 fn protocol_version_to_ciphersuite(
     protocol_version: NonZeroU16,
 ) -> Result<Ciphersuite, UnsupportedProtocolVersion> {
-    match protocol_version.get() {
-        DAVE_PROTOCOL_VERSION => Ok(Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256),
-        _ => Err(UnsupportedProtocolVersion(protocol_version)),
+    if protocol_version == DAVE_PROTOCOL_VERSION {
+        Ok(Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256)
+    } else {
+        Err(UnsupportedProtocolVersion(protocol_version))
     }
 }
 

@@ -185,7 +185,7 @@ impl ConnectionConfig {
             endpoint: endpoint.into(),
             gateway_version: 8,
             preferred_mode: Some(EncryptionMode::aead_aes256_gcm_rtpsize()),
-            max_dave_protocol_version: Some(DAVE_PROTOCOL_VERSION),
+            max_dave_protocol_version: Some(DAVE_PROTOCOL_VERSION.get()),
             dave_send_media_ready_timeout: crate::DAVE_SEND_MEDIA_READY_TIMEOUT,
             tuning: ConnectionTuning::default(),
         }
