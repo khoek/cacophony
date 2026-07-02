@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    sync::Arc,
     time::{Duration, Instant as StdInstant},
 };
 
@@ -11,8 +12,8 @@ use tokio::{
 use crate::{
     errors::{BackpressureError, Error, Result},
     gateway::{GatewayCommand, SpeakingCommand, SpeakingFlags},
-    media::{OutboundPacket, RtpPayload},
-    opus::{PayloadCodec, discord::Packet},
+    media::OutboundPacket,
+    opus::discord::{Packet, PacketBatch, PacketSpan},
     queue::DriverReply,
     stats::DurationStats,
 };
@@ -66,56 +67,55 @@ impl OpusPlayout {
         }
     }
 
-    pub async fn push_packet(&self, packet: &[u8], duration: Duration) -> Result<()> {
-        self.push_bytes_owned(packet.to_vec(), duration).await
-    }
-
-    pub async fn push_packet_owned(&self, packet: Packet) -> Result<()> {
-        self.push_payload_owned(packet).await
-    }
-
-    pub async fn push_payload_owned<P>(&self, payload: P) -> Result<()>
-    where
-        P: RtpPayload<Codec = PayloadCodec>,
-    {
-        let duration = payload.duration();
-        self.push_bytes_owned(payload.into_bytes(), duration).await
-    }
-
-    pub async fn push_bytes_owned(&self, packet: Vec<u8>, duration: Duration) -> Result<()> {
+    pub async fn push_packet(&self, packet: Packet) -> Result<()> {
         self.ensure_open()?;
         self.media_tx
             .send(PlayoutCommand::Frame {
                 id: self.id,
-                frame: PlayoutFrame {
-                    frame: packet,
-                    duration,
-                },
+                frame: PlayoutFrame::packet(packet),
             })
             .await
             .map_err(|_| Error::Closed)
     }
 
-    pub fn try_push_packet_owned(&self, packet: Packet) -> Result<()> {
-        self.try_push_payload_owned(packet)
+    pub async fn push_packet_batch(&self, packets: PacketBatch) -> Result<()> {
+        self.ensure_open()?;
+        let frames = PlayoutFrame::packet_batch(packets);
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.media_tx
+            .send(PlayoutCommand::Frames {
+                id: self.id,
+                frames,
+            })
+            .await
+            .map_err(|_| Error::Closed)
     }
 
-    pub fn try_push_payload_owned<P>(&self, payload: P) -> Result<()>
-    where
-        P: RtpPayload<Codec = PayloadCodec>,
-    {
-        let duration = payload.duration();
-        self.try_push_bytes_owned(payload.into_bytes(), duration)
-    }
-
-    pub fn try_push_bytes_owned(&self, packet: Vec<u8>, duration: Duration) -> Result<()> {
+    pub fn try_push_packet(&self, packet: Packet) -> Result<()> {
         self.ensure_open()?;
         match self.media_tx.try_send(PlayoutCommand::Frame {
             id: self.id,
-            frame: PlayoutFrame {
-                frame: packet,
-                duration,
-            },
+            frame: PlayoutFrame::packet(packet),
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(Error::Backpressure(BackpressureError::MediaQueueFull))
+            }
+        }
+    }
+
+    pub fn try_push_packet_batch(&self, packets: PacketBatch) -> Result<()> {
+        self.ensure_open()?;
+        let frames = PlayoutFrame::packet_batch(packets);
+        if frames.is_empty() {
+            return Ok(());
+        }
+        match self.media_tx.try_send(PlayoutCommand::Frames {
+            id: self.id,
+            frames,
         }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
@@ -163,6 +163,10 @@ pub(crate) enum PlayoutCommand {
         id: u64,
         frame: PlayoutFrame,
     },
+    Frames {
+        id: u64,
+        frames: Vec<PlayoutFrame>,
+    },
     Finish {
         id: u64,
         response: DriverReply<OpusPlayoutStats>,
@@ -181,14 +185,60 @@ impl PlayoutCommand {
             Self::Finish { response, .. } => {
                 response.complete_closed();
             }
-            Self::Frame { .. } | Self::Cancel { .. } => {}
+            Self::Frame { .. } | Self::Frames { .. } | Self::Cancel { .. } => {}
         }
     }
 }
 
 pub(crate) struct PlayoutFrame {
-    pub(super) frame: Vec<u8>,
-    pub(super) duration: Duration,
+    payload: PlayoutPayload,
+}
+
+enum PlayoutPayload {
+    Packet(Packet),
+    Batch {
+        bytes: Arc<Vec<u8>>,
+        span: PacketSpan,
+    },
+}
+
+impl PlayoutFrame {
+    fn packet(packet: Packet) -> Self {
+        Self {
+            payload: PlayoutPayload::Packet(packet),
+        }
+    }
+
+    fn packet_batch(packets: PacketBatch) -> Vec<Self> {
+        let (bytes, spans) = packets.into_parts();
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        let bytes = Arc::new(bytes);
+        spans
+            .into_iter()
+            .map(|span| Self {
+                payload: PlayoutPayload::Batch {
+                    bytes: bytes.clone(),
+                    span,
+                },
+            })
+            .collect()
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.payload {
+            PlayoutPayload::Packet(packet) => packet.bytes(),
+            PlayoutPayload::Batch { bytes, span } => &bytes[span.range()],
+        }
+    }
+
+    fn duration(&self) -> Duration {
+        match &self.payload {
+            PlayoutPayload::Packet(packet) => packet.duration(),
+            PlayoutPayload::Batch { span, .. } => span.duration(),
+        }
+    }
 }
 
 pub(super) struct ActiveOpusPlayout {
@@ -220,6 +270,16 @@ impl ActiveOpusPlayout {
     }
 
     pub(super) fn push(&mut self, frame: PlayoutFrame) {
+        self.record_underflow_if_needed();
+        self.frames.push_back(frame);
+    }
+
+    pub(super) fn push_many(&mut self, frames: impl IntoIterator<Item = PlayoutFrame>) {
+        self.record_underflow_if_needed();
+        self.frames.extend(frames);
+    }
+
+    fn record_underflow_if_needed(&mut self) {
         if self.frames.is_empty() && self.finish_response.is_none() {
             let now = Instant::now();
             if self
@@ -231,7 +291,6 @@ impl ActiveOpusPlayout {
                 self.stats.underflow_wait.observe(now - next_send_at);
             }
         }
-        self.frames.push_back(frame);
     }
 
     pub(super) fn finish(&mut self, response: DriverReply<OpusPlayoutStats>) {
@@ -382,7 +441,7 @@ where
                 let id = self.send.next_playout_id;
                 self.send.next_playout_id = self.send.next_playout_id.wrapping_add(1).max(1);
                 self.send.active_playout =
-                    Some(ActiveOpusPlayout::new(id, self.dave_send_active()));
+                    Some(ActiveOpusPlayout::new(id, self.dave_send_requires_dave()));
                 response.complete(Ok(id));
             }
             PlayoutCommand::Frame { id, frame } => {
@@ -393,6 +452,16 @@ where
                     .filter(|playout| playout.id == id)
                 {
                     playout.push(frame);
+                }
+            }
+            PlayoutCommand::Frames { id, frames } => {
+                if let Some(playout) = self
+                    .send
+                    .active_playout
+                    .as_mut()
+                    .filter(|playout| playout.id == id)
+                {
+                    playout.push_many(frames);
                 }
             }
             PlayoutCommand::Finish { id, response } => {
@@ -437,7 +506,7 @@ where
             return Ok(());
         }
 
-        let Some(frame_duration) = playout.frames.front().map(|frame| frame.duration) else {
+        let Some(frame_duration) = playout.frames.front().map(PlayoutFrame::duration) else {
             self.send.active_playout = Some(playout);
             return Ok(());
         };
@@ -465,8 +534,13 @@ where
             playout.stats.record_lateness(scheduler_lateness);
         }
 
-        if self.dave_send_active() && !self.current_dave_media_status().media_ready {
-            let timeout = self.state.internal().config.dave_send_media_ready_timeout;
+        if self.dave_send_requires_dave() && !self.current_dave_media_status().media_ready {
+            let timeout = self
+                .state
+                .internal()
+                .config
+                .options
+                .dave_send_media_ready_timeout;
             let deadline = *playout
                 .media_ready_deadline
                 .get_or_insert_with(|| Instant::now() + timeout);
@@ -499,7 +573,7 @@ where
         let send_started = Instant::now();
         playout.stats.record_send_started(send_started);
         let packet = match self
-            .send_ready_opus_frame(frame.frame, frame_duration, close_rx)
+            .send_ready_opus_packet(frame.bytes(), frame_duration, close_rx)
             .await
         {
             Ok(packet) => packet,
@@ -556,5 +630,52 @@ where
             user_id: None,
         }))
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opus::discord::PacketSink;
+
+    const OPUS_SILENCE: &[u8] = &[0xf8, 0xff, 0xfe];
+
+    fn test_packet_batch(packet_count: usize) -> PacketBatch {
+        let mut packets = PacketBatch::new();
+        for _ in 0..packet_count {
+            packets
+                .encode_packet(|output| {
+                    output.extend_from_slice(OPUS_SILENCE);
+                    Ok(output.len())
+                })
+                .unwrap();
+        }
+        packets
+    }
+
+    #[tokio::test]
+    async fn push_packet_batch_sends_one_batch_command() {
+        let (media_tx, mut media_rx) = mpsc::channel(1);
+        let mut playout = OpusPlayout {
+            id: 7,
+            media_tx,
+            close: ConnectionClose::new(),
+            finished: false,
+        };
+
+        playout
+            .push_packet_batch(test_packet_batch(2))
+            .await
+            .unwrap();
+        playout.finished = true;
+
+        match media_rx.recv().await.unwrap() {
+            PlayoutCommand::Frames { id, frames } => {
+                assert_eq!(id, 7);
+                assert_eq!(frames.len(), 2);
+                assert!(frames.iter().all(|frame| frame.bytes() == OPUS_SILENCE));
+            }
+            _ => panic!("packet batch should be queued as one Frames command"),
+        }
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     fmt,
     ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign},
+    time::Duration,
 };
 
 use futures_util::StreamExt;
@@ -14,12 +15,17 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{
     GatewayWebSocketRead,
+    codecs::{self, DiscordRtpCodecMap},
     connection::ConnectionStateStore,
     errors::{DaveError, DaveGatewayPayloadError, Error, ProtocolError, Result},
     media::TransportCryptoConfig,
-    media::update_state,
     observer::{ClientsConnectedEvent, ConnectionObserver},
-    state::{DavePendingMediaRetry, EncryptionMode, SessionDescription, ValidatedConnectionConfig},
+    rtp::RtpPayloadType,
+    state::{
+        ConnectionCodecPreferences, DaveMlsMessageIdentity, DaveMlsMessageKind,
+        DavePendingMediaRetry, EncryptionMode, OfferedEncryptionMode, PendingDaveMlsMessage,
+        SessionDescription, ValidatedConnectionConfig, ValidatedConnectionOptions,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +44,7 @@ pub(crate) enum Opcode {
     ClientsConnect = 11,
     ClientConnect = 12,
     ClientDisconnect = 13,
+    SessionUpdate = 14,
     DavePrepareTransition = 21,
     DaveExecuteTransition = 22,
     DaveTransitionReady = 23,
@@ -52,7 +59,7 @@ pub(crate) enum Opcode {
 }
 
 impl Opcode {
-    pub(crate) const ALL: [Self; 24] = [
+    pub(crate) const ALL: [Self; 25] = [
         Self::Identify,
         Self::SelectProtocol,
         Self::Ready,
@@ -66,6 +73,7 @@ impl Opcode {
         Self::ClientsConnect,
         Self::ClientConnect,
         Self::ClientDisconnect,
+        Self::SessionUpdate,
         Self::DavePrepareTransition,
         Self::DaveExecuteTransition,
         Self::DaveTransitionReady,
@@ -85,6 +93,14 @@ impl Opcode {
 
     pub(crate) const fn byte(self) -> u8 {
         self as u8
+    }
+
+    pub(crate) const fn dave_mls_message_kind(self) -> Option<DaveMlsMessageKind> {
+        match self {
+            Self::DaveMlsAnnounceCommitTransition => Some(DaveMlsMessageKind::Commit),
+            Self::DaveMlsWelcome => Some(DaveMlsMessageKind::Welcome),
+            _ => None,
+        }
     }
 
     pub(crate) fn from_code(code: u64) -> Option<Self> {
@@ -256,17 +272,48 @@ pub(crate) struct IdentifyCommand<'a> {
     user_id: String,
     session_id: &'a str,
     token: &'a str,
+    #[serde(skip_serializing_if = "is_false")]
+    video: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    streams: Vec<IdentifyStream>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_dave_protocol_version: Option<u16>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct IdentifyStream {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    rid: &'static str,
+    quality: u8,
+    active: bool,
+}
+
+const PRIMARY_VIDEO_RID: &str = "100";
+const PRIMARY_VIDEO_QUALITY: u8 = 100;
+const OPUS_SELECT_PROTOCOL_PRIORITY: u32 = 1_000;
+const VIDEO_SELECT_PROTOCOL_PRIORITY_BASE: u32 = 2_000;
+const SELECT_PROTOCOL_PRIORITY_STEP: u32 = 1_000;
+
 impl<'a> IdentifyCommand<'a> {
     pub(crate) fn from_config(config: &'a ValidatedConnectionConfig) -> Self {
+        let video = config.options.codec_preferences.video_enabled();
         Self {
             server_id: config.identity.guild_id.to_string(),
             user_id: config.identity.user_id.to_string(),
             session_id: config.secrets.session_id.as_str(),
             token: config.secrets.token.as_str(),
+            video,
+            streams: if video {
+                vec![IdentifyStream {
+                    kind: "video",
+                    rid: PRIMARY_VIDEO_RID,
+                    quality: PRIMARY_VIDEO_QUALITY,
+                    active: true,
+                }]
+            } else {
+                Vec::new()
+            },
             max_dave_protocol_version: config.options.max_dave_protocol_version,
         }
     }
@@ -280,10 +327,17 @@ pub(crate) fn identify_payload(config: &ValidatedConnectionConfig) -> Result<Str
 pub(crate) struct SelectProtocolCommand {
     protocol: &'static str,
     pub(crate) data: SelectProtocolData,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    codecs: Vec<SelectProtocolCodec>,
 }
 
 impl SelectProtocolCommand {
-    pub(crate) fn udp(address: String, port: u16, mode: EncryptionMode) -> Self {
+    pub(crate) fn udp(
+        address: String,
+        port: u16,
+        mode: EncryptionMode,
+        codec_preferences: &ConnectionCodecPreferences,
+    ) -> Self {
         Self {
             protocol: "udp",
             data: SelectProtocolData {
@@ -291,6 +345,7 @@ impl SelectProtocolCommand {
                 port,
                 mode,
             },
+            codecs: select_protocol_codecs(codec_preferences),
         }
     }
 }
@@ -300,6 +355,67 @@ pub(crate) struct SelectProtocolData {
     address: String,
     port: u16,
     mode: EncryptionMode,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SelectProtocolCodec {
+    name: &'static str,
+    #[serde(rename = "type")]
+    media_type: &'static str,
+    priority: u32,
+    payload_type: RtpPayloadType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtx_payload_type: Option<RtpPayloadType>,
+    encode: bool,
+    decode: bool,
+}
+
+impl SelectProtocolCodec {
+    fn from_codec(codec: dave::Codec, priority: u32) -> Self {
+        let descriptor = codecs::descriptor(codec);
+        Self {
+            name: descriptor.wire_name,
+            media_type: codec.media_type().as_str(),
+            priority,
+            payload_type: descriptor.payload_type,
+            rtx_payload_type: descriptor.rtx_payload_type,
+            encode: true,
+            decode: true,
+        }
+    }
+}
+
+fn select_protocol_codecs(
+    codec_preferences: &ConnectionCodecPreferences,
+) -> Vec<SelectProtocolCodec> {
+    if !codec_preferences.video_enabled() {
+        return Vec::new();
+    }
+
+    std::iter::once(SelectProtocolCodec::from_codec(
+        dave::Codec::Opus,
+        OPUS_SELECT_PROTOCOL_PRIORITY,
+    ))
+    .chain(
+        codec_preferences
+            .video_codecs()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, codec)| {
+                SelectProtocolCodec::from_codec(
+                    codec,
+                    VIDEO_SELECT_PROTOCOL_PRIORITY_BASE
+                        + u32::try_from(index).expect("codec preference count fits u32")
+                            * SELECT_PROTOCOL_PRIORITY_STEP,
+                )
+            }),
+    )
+    .collect()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -370,6 +486,14 @@ pub(crate) struct DavePrepareTransitionEvent {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub(crate) struct SessionUpdateEvent {
+    #[serde(default)]
+    audio_codec: Option<String>,
+    #[serde(default)]
+    video_codec: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct DaveExecuteTransitionEvent {
     transition_id: u16,
 }
@@ -412,9 +536,100 @@ pub struct GatewayReady {
     pub ip: String,
     pub port: u16,
     #[serde(default)]
-    pub modes: Vec<EncryptionMode>,
+    pub modes: Vec<OfferedEncryptionMode>,
     #[serde(default)]
     pub heartbeat_interval: Option<u64>,
+    #[serde(default)]
+    pub streams: Vec<GatewayReadyStream>,
+}
+
+impl GatewayReady {
+    pub(crate) fn select_encryption_mode(
+        &self,
+        options: &ValidatedConnectionOptions,
+    ) -> Result<EncryptionMode> {
+        if self.modes.is_empty() {
+            return Err(Error::Protocol(ProtocolError::ReadyMissingEncryptionModes));
+        }
+
+        if let Some(required_mode) = options.required_mode {
+            if self.offers_mode(required_mode) {
+                return Ok(required_mode);
+            }
+            return Err(Error::Protocol(
+                ProtocolError::RequiredEncryptionModeUnavailable {
+                    required_mode,
+                    modes: self.modes.clone(),
+                },
+            ));
+        }
+
+        for mode in EncryptionMode::ALL {
+            if self.offers_mode(mode) {
+                return Ok(mode);
+            }
+        }
+
+        Err(Error::Protocol(
+            ProtocolError::ReadyMissingSupportedEncryptionMode {
+                modes: self.modes.clone(),
+            },
+        ))
+    }
+
+    pub(crate) fn primary_video_stream(&self) -> Option<GatewayReadyVideoStream> {
+        self.streams
+            .iter()
+            .filter(|stream| stream.is_active_video())
+            .max_by_key(|stream| {
+                (
+                    stream.rid.as_deref() == Some(PRIMARY_VIDEO_RID),
+                    stream.quality == Some(PRIMARY_VIDEO_QUALITY),
+                    stream.quality.unwrap_or_default(),
+                )
+            })
+            .or_else(|| {
+                (self.streams.len() == 1 && self.streams[0].active != Some(false))
+                    .then(|| &self.streams[0])
+            })
+            .map(|stream| GatewayReadyVideoStream {
+                ssrc: stream.ssrc,
+                rtx_ssrc: stream.rtx_ssrc,
+            })
+    }
+
+    fn offers_mode(&self, mode: EncryptionMode) -> bool {
+        self.modes
+            .iter()
+            .any(|offered| offered.supported() == Some(mode))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GatewayReadyVideoStream {
+    pub(crate) ssrc: u32,
+    pub(crate) rtx_ssrc: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GatewayReadyStream {
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub rid: Option<String>,
+    pub ssrc: u32,
+    #[serde(default)]
+    pub rtx_ssrc: Option<u32>,
+    #[serde(default)]
+    pub quality: Option<u8>,
+    #[serde(default)]
+    pub active: Option<bool>,
+}
+
+impl GatewayReadyStream {
+    fn is_active_video(&self) -> bool {
+        self.kind.as_deref() == Some("video") && self.active != Some(false)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -599,8 +814,9 @@ pub(crate) struct GatewayEventEffects {
     pub(crate) disconnected_user_ids: Vec<u64>,
     pub(crate) removed_ssrcs: Vec<u32>,
     pub(crate) retry_dave_pending_media: DavePendingMediaRetry,
-    pub(crate) allow_transition_receive_passthrough: bool,
+    pub(crate) allow_plaintext_receive_grace: bool,
     pub(crate) transport_crypto: Option<TransportCryptoConfig>,
+    pub(crate) media_session_updated: bool,
 }
 
 pub(crate) fn replay_pending_voice_events(
@@ -608,28 +824,250 @@ pub(crate) fn replay_pending_voice_events(
     pending_events: Vec<PendingGatewayEvent>,
     observer: &impl ConnectionObserver,
 ) -> Result<()> {
-    let mut heartbeat_ack_pending = false;
-    let mut heartbeat_sent_at = None;
+    let mut heartbeat_ack = GatewayHeartbeatAckState::default();
+    let mut handler = GatewayEventHandler::new(state, &mut heartbeat_ack, observer);
     for event in pending_events {
         match event {
             PendingGatewayEvent::Text(event) => {
                 if let Some(seq) = event.seq {
-                    update_state(state, |state| state.last_seq = Some(seq));
+                    handler
+                        .state_store
+                        .update(|state| state.last_seq = Some(seq));
                 }
-                let _ = handle_voice_text_event(
-                    state,
-                    event,
-                    &mut heartbeat_ack_pending,
-                    &mut heartbeat_sent_at,
-                    observer,
-                )?;
+                let _ = handler.handle_text_event(event)?;
             }
             PendingGatewayEvent::Binary(bytes) => {
-                let _ = handle_voice_binary_event(state, &bytes)?;
+                let _ = handle_voice_binary_event(&mut *handler.state_store, &bytes)?;
             }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GatewayHeartbeatAckState {
+    pending: bool,
+    sent_at: Option<Instant>,
+}
+
+impl GatewayHeartbeatAckState {
+    pub(crate) fn is_pending(self) -> bool {
+        self.pending
+    }
+
+    pub(crate) fn timed_out(self, timeout: Duration) -> bool {
+        self.sent_at
+            .is_some_and(|sent_at| sent_at.elapsed() >= timeout)
+    }
+
+    pub(crate) fn mark_sent(&mut self, sent_at: Instant) {
+        self.pending = true;
+        self.sent_at = Some(sent_at);
+    }
+
+    fn acknowledge(&mut self) {
+        self.pending = false;
+        self.sent_at = None;
+    }
+}
+
+pub(crate) struct GatewayEventHandler<'a, O>
+where
+    O: ConnectionObserver,
+{
+    state_store: &'a mut ConnectionStateStore,
+    heartbeat_ack: &'a mut GatewayHeartbeatAckState,
+    observer: &'a O,
+}
+
+impl<'a, O> GatewayEventHandler<'a, O>
+where
+    O: ConnectionObserver,
+{
+    pub(crate) fn new(
+        state_store: &'a mut ConnectionStateStore,
+        heartbeat_ack: &'a mut GatewayHeartbeatAckState,
+        observer: &'a O,
+    ) -> Self {
+        Self {
+            state_store,
+            heartbeat_ack,
+            observer,
+        }
+    }
+
+    pub(crate) fn handle_text_event(
+        &mut self,
+        event: ParsedVoiceGatewayEvent,
+    ) -> Result<GatewayEventEffects> {
+        let state = self.state_store.internal();
+        let endpoint = state.config.endpoint.clone();
+        let guild_id = state.config.identity.guild_id;
+        let user_id = state.config.identity.user_id;
+        let mut effects = GatewayEventEffects::default();
+
+        match Opcode::from_code(event.opcode) {
+            Some(Opcode::SessionDescription) => {
+                let description: SessionDescription = parse_data(event.data)?;
+                let rtp_codecs =
+                    DiscordRtpCodecMap::new(&description, &state.config.options.codec_preferences)?;
+                effects.transport_crypto = Some(description.transport_crypto.clone());
+                effects.media_session_updated = true;
+                self.state_store.update(|state| {
+                    state
+                        .dave
+                        .set_session_protocol(description.dave_protocol_version);
+                    state.session_description = Some(description);
+                    state.rtp_codecs = Some(rtp_codecs);
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::SessionUpdate) => {
+                let update: SessionUpdateEvent = parse_data(event.data)?;
+                if update.audio_codec.is_some() || update.video_codec.is_some() {
+                    let mut description =
+                        self.state_store
+                            .internal()
+                            .session_description
+                            .clone()
+                            .ok_or(Error::Protocol(ProtocolError::MissingSessionDescription))?;
+                    if let Some(audio_codec) = update.audio_codec {
+                        description.audio_codec = Some(audio_codec);
+                    }
+                    if let Some(video_codec) = update.video_codec {
+                        description.video_codec = Some(video_codec);
+                    }
+                    let rtp_codecs = DiscordRtpCodecMap::new(
+                        &description,
+                        &state.config.options.codec_preferences,
+                    )?;
+                    self.state_store.update(|state| {
+                        state.session_description = Some(description);
+                        state.rtp_codecs = Some(rtp_codecs);
+                    });
+                    effects.media_session_updated = true;
+                }
+            }
+            Some(Opcode::Resumed) => {
+                self.state_store.update(|state| state.resumed = true);
+            }
+            Some(Opcode::DavePrepareTransition) => {
+                let transition: DavePrepareTransitionEvent = parse_data(event.data)?;
+                self.state_store.update(|state| {
+                    state
+                        .dave
+                        .prepare_transition(transition.transition_id, transition.protocol_version);
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::DaveExecuteTransition) => {
+                let transition: DaveExecuteTransitionEvent = parse_data(event.data)?;
+                let allow_plaintext_receive_grace = {
+                    let dave = &self.state_store.internal().dave;
+                    dave.transition_id() == Some(transition.transition_id)
+                        && dave.active_receive_protocol_version().unwrap_or(0) == 0
+                        && dave.protocol_version().unwrap_or(0) > 0
+                };
+                self.state_store.update(|state| {
+                    state.dave.execute_transition(transition.transition_id);
+                });
+                effects.allow_plaintext_receive_grace = allow_plaintext_receive_grace;
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::DavePrepareEpoch) => {
+                let epoch: DavePrepareEpochEvent = parse_data(event.data)?;
+                self.state_store.update(|state| {
+                    state
+                        .dave
+                        .prepare_epoch(epoch.protocol_version, epoch.epoch);
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::Speaking) => {
+                let update: SpeakingUpdate = parse_data(event.data)?;
+                self.state_store.update(|state| {
+                    if let Some(user_id) = update.user_id.as_ref() {
+                        state.ssrc_users_mut().insert(update.ssrc, user_id.get());
+                    }
+                    state.speaking_mut().insert(update.ssrc, update);
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::missing_user());
+            }
+            Some(Opcode::ClientsConnect) => {
+                let clients: ClientsConnectEvent = parse_data(event.data)?;
+                self.state_store.update(|state| {
+                    state.roster_authoritative = true;
+                    state
+                        .connected_user_ids_mut()
+                        .extend(clients.user_ids.iter().map(DiscordId::get));
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+                if !clients.user_ids.is_empty() {
+                    self.observer.clients_connected(ClientsConnectedEvent {
+                        endpoint: &endpoint,
+                        guild_id,
+                        user_id,
+                        user_count: clients.user_ids.len(),
+                    });
+                }
+            }
+            Some(Opcode::ClientConnect) => {
+                let client: ClientConnectEvent = parse_data(event.data)?;
+                self.state_store.update(|state| {
+                    state.roster_authoritative = true;
+                    state.connected_user_ids_mut().insert(client.user_id.get());
+                    if let Some(ssrc) = client.ssrc() {
+                        state.ssrc_users_mut().insert(ssrc, client.user_id.get());
+                    }
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::missing_user());
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::ClientDisconnect) => {
+                let disconnect: ClientDisconnectEvent = parse_data(event.data)?;
+                let disconnected_user_id = disconnect.user_id.get();
+                effects.disconnected_user_ids.push(disconnected_user_id);
+                self.state_store.update(|state| {
+                    state.roster_authoritative = true;
+                    state.connected_user_ids_mut().remove(&disconnected_user_id);
+                    state.ssrc_users_mut().retain(|ssrc, stored_user_id| {
+                        if stored_user_id == &disconnected_user_id {
+                            effects.removed_ssrcs.push(*ssrc);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                });
+                effects
+                    .retry_dave_pending_media
+                    .include(DavePendingMediaRetry::dave_state());
+            }
+            Some(Opcode::HeartbeatAck) => {
+                self.heartbeat_ack.acknowledge();
+            }
+            Some(Opcode::Hello | Opcode::Ready | Opcode::Heartbeat | Opcode::Resume) => {}
+            _ => {}
+        }
+
+        Ok(effects)
+    }
 }
 
 pub(crate) fn parse_event_text(text: &str) -> Result<ParsedVoiceGatewayEvent> {
@@ -648,153 +1086,6 @@ where
     Ok(serde_json::from_value(data)?)
 }
 
-pub(crate) fn handle_voice_text_event(
-    state_store: &mut ConnectionStateStore,
-    event: ParsedVoiceGatewayEvent,
-    heartbeat_ack_pending: &mut bool,
-    heartbeat_sent_at: &mut Option<Instant>,
-    observer: &impl ConnectionObserver,
-) -> Result<GatewayEventEffects> {
-    let state = state_store.internal();
-    let endpoint = state.config.endpoint.clone();
-    let guild_id = state.config.identity.guild_id;
-    let user_id = state.config.identity.user_id;
-    let mut effects = GatewayEventEffects::default();
-
-    match Opcode::from_code(event.opcode) {
-        Some(Opcode::SessionDescription) => {
-            let description: SessionDescription = parse_data(event.data)?;
-            effects.transport_crypto = Some(description.transport_crypto.clone());
-            update_state(state_store, |state| {
-                state
-                    .dave
-                    .set_session_protocol(description.dave_protocol_version);
-                state.session_description = Some(description);
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::Resumed) => {
-            update_state(state_store, |state| state.resumed = true);
-        }
-        Some(Opcode::DavePrepareTransition) => {
-            let transition: DavePrepareTransitionEvent = parse_data(event.data)?;
-            update_state(state_store, |state| {
-                state
-                    .dave
-                    .prepare_transition(transition.transition_id, transition.protocol_version);
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::DaveExecuteTransition) => {
-            let transition: DaveExecuteTransitionEvent = parse_data(event.data)?;
-            let allow_transition_receive_passthrough = {
-                let dave = &state_store.internal().dave;
-                dave.transition_id == Some(transition.transition_id)
-                    && dave.active_receive_protocol_version.unwrap_or(0) == 0
-                    && dave.protocol_version.unwrap_or(0) > 0
-            };
-            update_state(state_store, |state| {
-                state.dave.execute_transition(transition.transition_id);
-            });
-            effects.allow_transition_receive_passthrough = allow_transition_receive_passthrough;
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::DavePrepareEpoch) => {
-            let epoch: DavePrepareEpochEvent = parse_data(event.data)?;
-            update_state(state_store, |state| {
-                state
-                    .dave
-                    .prepare_epoch(epoch.protocol_version, epoch.epoch);
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::Speaking) => {
-            let update: SpeakingUpdate = parse_data(event.data)?;
-            update_state(state_store, |state| {
-                if let Some(user_id) = update.user_id.as_ref() {
-                    state.ssrc_users_mut().insert(update.ssrc, user_id.get());
-                }
-                state.speaking_mut().insert(update.ssrc, update);
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::missing_user());
-        }
-        Some(Opcode::ClientsConnect) => {
-            let clients: ClientsConnectEvent = parse_data(event.data)?;
-            update_state(state_store, |state| {
-                state.roster_authoritative = true;
-                state
-                    .connected_user_ids_mut()
-                    .extend(clients.user_ids.iter().map(DiscordId::get));
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-            if !clients.user_ids.is_empty() {
-                observer.clients_connected(ClientsConnectedEvent {
-                    endpoint: &endpoint,
-                    guild_id,
-                    user_id,
-                    user_count: clients.user_ids.len(),
-                });
-            }
-        }
-        Some(Opcode::ClientConnect) => {
-            let client: ClientConnectEvent = parse_data(event.data)?;
-            update_state(state_store, |state| {
-                state.roster_authoritative = true;
-                state.connected_user_ids_mut().insert(client.user_id.get());
-                if let Some(ssrc) = client.ssrc() {
-                    state.ssrc_users_mut().insert(ssrc, client.user_id.get());
-                }
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::missing_user());
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::ClientDisconnect) => {
-            let disconnect: ClientDisconnectEvent = parse_data(event.data)?;
-            let disconnected_user_id = disconnect.user_id.get();
-            effects.disconnected_user_ids.push(disconnected_user_id);
-            update_state(state_store, |state| {
-                state.roster_authoritative = true;
-                state.connected_user_ids_mut().remove(&disconnected_user_id);
-                state.ssrc_users_mut().retain(|ssrc, stored_user_id| {
-                    if stored_user_id == &disconnected_user_id {
-                        effects.removed_ssrcs.push(*ssrc);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Some(Opcode::HeartbeatAck) => {
-            *heartbeat_ack_pending = false;
-            *heartbeat_sent_at = None;
-        }
-        Some(Opcode::Hello | Opcode::Ready | Opcode::Heartbeat | Opcode::Resume) => {}
-        _ => {}
-    }
-
-    Ok(effects)
-}
-
 pub(crate) fn handle_voice_binary_event(
     state_store: &mut ConnectionStateStore,
     bytes: &[u8],
@@ -803,50 +1094,30 @@ pub(crate) fn handle_voice_binary_event(
     let Some(event) = BinaryEvent::parse(bytes) else {
         return Ok(effects);
     };
-    if let Some(seq) = event.seq {
-        update_state(state_store, |state| state.last_seq = Some(seq));
-    }
+    state_store.update(|state| state.last_seq = Some(event.seq));
 
     match event.opcode {
         Opcode::DaveMlsExternalSender => {
-            update_state(state_store, |state| {
-                state.dave.external_sender = Some(event.payload.to_vec())
-            });
+            state_store.update(|state| state.dave.external_sender = Some(event.payload.to_vec()));
             effects
                 .retry_dave_pending_media
                 .include(DavePendingMediaRetry::dave_state());
         }
         Opcode::DaveMlsProposals => {
-            update_state(state_store, |state| {
-                state.dave.proposals.push(event.payload.to_vec())
-            });
+            state_store.update(|state| state.dave.proposals.push(event.payload.to_vec()));
             effects
                 .retry_dave_pending_media
                 .include(DavePendingMediaRetry::dave_state());
         }
-        Opcode::DaveMlsAnnounceCommitTransition => {
+        Opcode::DaveMlsAnnounceCommitTransition | Opcode::DaveMlsWelcome => {
+            let kind = event
+                .opcode
+                .dave_mls_message_kind()
+                .expect("DAVE MLS message opcode has a message kind");
             let payload = DaveTransitionBinaryPayload::parse(event)?;
-            let commit = payload.body.to_vec();
-            update_state(state_store, |state| {
-                if state.dave.transition_id != Some(payload.transition_id) {
-                    state.dave.clear_pending_mls();
-                }
-                state.dave.transition_id = Some(payload.transition_id);
-                state.dave.pending_commit = Some(commit);
-            });
-            effects
-                .retry_dave_pending_media
-                .include(DavePendingMediaRetry::dave_state());
-        }
-        Opcode::DaveMlsWelcome => {
-            let payload = DaveTransitionBinaryPayload::parse(event)?;
-            let welcome = payload.body.to_vec();
-            update_state(state_store, |state| {
-                if state.dave.transition_id != Some(payload.transition_id) {
-                    state.dave.clear_pending_mls();
-                }
-                state.dave.transition_id = Some(payload.transition_id);
-                state.dave.pending_welcome = Some(welcome);
+            let message = payload.pending_message(kind);
+            state_store.update(|state| {
+                state.dave.set_pending_mls_message(message);
             });
             effects
                 .retry_dave_pending_media
@@ -860,6 +1131,7 @@ pub(crate) fn handle_voice_binary_event(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DaveTransitionBinaryPayload<'a> {
+    seq: i64,
     transition_id: u16,
     body: &'a [u8],
 }
@@ -879,14 +1151,26 @@ impl<'a> DaveTransitionBinaryPayload<'a> {
             .into());
         }
         Ok(Self {
+            seq: event.seq,
             transition_id: u16::from_be_bytes([event.payload[0], event.payload[1]]),
             body: &event.payload[Self::TRANSITION_ID_LEN..],
         })
     }
+
+    fn pending_message(self, kind: DaveMlsMessageKind) -> PendingDaveMlsMessage {
+        PendingDaveMlsMessage::new(
+            DaveMlsMessageIdentity {
+                kind,
+                seq: self.seq,
+                transition_id: self.transition_id,
+            },
+            self.body.to_vec(),
+        )
+    }
 }
 
 pub(crate) struct BinaryEvent<'a> {
-    pub(crate) seq: Option<i64>,
+    pub(crate) seq: i64,
     pub(crate) opcode: Opcode,
     pub(crate) payload: &'a [u8],
 }
@@ -897,7 +1181,7 @@ impl<'a> BinaryEvent<'a> {
             [first, second, opcode, payload @ ..] => {
                 let opcode = Opcode::from_server_binary(*opcode)?;
                 Some(Self {
-                    seq: Some(i64::from(u16::from_be_bytes([*first, *second]))),
+                    seq: i64::from(u16::from_be_bytes([*first, *second])),
                     opcode,
                     payload,
                 })

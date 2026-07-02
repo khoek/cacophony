@@ -1,24 +1,35 @@
+pub mod codec;
 mod error;
 mod frame;
 mod gcm;
-mod leb128;
+mod identity;
+pub mod leb128;
+mod passthrough;
 mod ratchet;
 mod session;
-
-use std::num::NonZeroU16;
+mod version;
 
 pub use error::{
-    CreateKeyPackageError, DecryptError, EncryptError, Error, FrameDecryptError, InitError,
+    CreateKeyPackageError, CredentialPolicyError, DecryptError, DisplayableCodeError, EncryptError,
+    Error, FingerprintError, FrameDecryptError, GroupPolicyError, IdentityKeyError, InitError,
     ProcessCommitError, ProcessProposalsError, ProcessWelcomeError, SetExternalSenderError,
-    UnsupportedProtocolVersion,
+    UnsupportedProtocolVersion, UpdateRatchetsError, VerificationError,
 };
 pub use frame::{
-    Av1, Codec, DynamicMediaFrame, FrameCodec, H264, H265, MediaFrame, MediaType,
-    OPUS_SILENCE_FRAME, Opus, Vp8, Vp9,
+    Av1, Codec, CodecVisitor, DynamicMediaFrame, FrameCodec, H26xFrameCodec, H264, H265,
+    MediaFrame, MediaType, OPUS_SILENCE_FRAME, Opus, TypedMediaFrame, TypedMediaFrameVisitor, Vp8,
+    Vp9,
 };
+pub use identity::{
+    DAVE_IDENTITY_KEY_VERSION, DISPLAY_CODE_GROUP_DIGITS, EPOCH_AUTHENTICATOR_DISPLAY_DIGITS,
+    IdentityKeyPair, IdentityKeyPersistence, IdentityPublicKey, IdentityPublicKeyUpload,
+    PAIRWISE_FINGERPRINT_BYTES, PAIRWISE_FINGERPRINT_DISPLAY_DIGITS, SessionIdentity,
+    displayable_code, epoch_authenticator_display_code, pairwise_fingerprint,
+    pairwise_fingerprint_display_code,
+};
+pub use passthrough::PassthroughMode;
 pub use session::{
-    CommitWelcome, FrameEncryptResult, ProposalsOperation, Session, SessionStatus,
-    validate_protocol_version,
+    CommitWelcome, ExpectedUserIds, ProposalsOperation, Session, SessionConfig, SessionOptions,
+    SessionStatus,
 };
-
-pub const DAVE_PROTOCOL_VERSION: NonZeroU16 = NonZeroU16::new(1).unwrap();
+pub use version::{DAVE_PROTOCOL_VERSION, DaveProtocolVersion};

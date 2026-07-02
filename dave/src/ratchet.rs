@@ -1,6 +1,6 @@
 use std::{
     cmp::max,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -16,9 +16,9 @@ use crate::{
         CIPHER_EXPIRY, FrameCipher, FrameCodec, FrameParseScratch, GENERATION_WRAP,
         MAX_CIPHERTEXT_VALIDATION_RETRIES, MAX_FRAMES_PER_SECOND, MAX_GENERATION_GAP,
         MAX_MISSING_NONCES, MediaFrame, MediaType, OPUS_SILENCE_FRAME, OutboundFrameProcessor,
-        ParsedFrame, RATCHET_EXPIRY, RATCHET_GENERATION_SHIFT_BITS, max_ciphertext_len,
-        validate_processed_frame,
+        ParsedFrame, RATCHET_EXPIRY, RATCHET_GENERATION_SHIFT_BITS,
     },
+    passthrough::{PassthroughMode, PlaintextPassthrough},
 };
 
 #[derive(Debug, TlsSerialize, TlsSize)]
@@ -126,7 +126,7 @@ impl Encryptor {
     where
         C: FrameCodec,
     {
-        output.reserve(max_ciphertext_len(frame));
+        output.reserve(frame.max_ciphertext_len());
         self.frame_processor.process::<C>(frame.payload());
         for _ in 0..MAX_CIPHERTEXT_VALIDATION_RETRIES {
             let truncated_nonce = self.advance_cipher()?;
@@ -139,7 +139,7 @@ impl Encryptor {
                 return Err(EncryptError::MissingRatchetKey);
             };
             let len = cipher.encrypt_processed(truncated_nonce, frame_processor, output)?;
-            if validate_processed_frame::<C>(frame_processor, output) {
+            if frame_processor.validate_processed::<C>(output) {
                 return Ok(len);
             }
         }
@@ -169,7 +169,7 @@ impl Encryptor {
 pub(crate) struct Decryptor {
     clock: Instant,
     managers: VecDeque<CryptorManager>,
-    passthrough_until: Option<Instant>,
+    passthrough: PlaintextPassthrough,
     frame_parse_scratch: FrameParseScratch,
     frame_decrypt_scratch: crate::frame::FrameDecryptScratch,
 }
@@ -179,7 +179,7 @@ impl Default for Decryptor {
         Self {
             clock: Instant::now(),
             managers: VecDeque::new(),
-            passthrough_until: Some(Instant::now()),
+            passthrough: PlaintextPassthrough::disabled(),
             frame_parse_scratch: FrameParseScratch::default(),
             frame_decrypt_scratch: crate::frame::FrameDecryptScratch::default(),
         }
@@ -187,9 +187,9 @@ impl Default for Decryptor {
 }
 
 impl Decryptor {
-    pub(crate) fn with_passthrough_until(passthrough_until: Option<Instant>) -> Self {
+    pub(crate) fn with_plaintext_passthrough(passthrough: PlaintextPassthrough) -> Self {
         Self {
-            passthrough_until,
+            passthrough,
             ..Self::default()
         }
     }
@@ -200,16 +200,8 @@ impl Decryptor {
             .push_back(CryptorManager::new(self.clock, ratchet));
     }
 
-    pub(crate) fn transition_to_passthrough(&mut self, enabled: bool, transition_expiry: Duration) {
-        if enabled {
-            self.passthrough_until = None;
-            return;
-        }
-        let expiry = Instant::now() + transition_expiry;
-        self.passthrough_until = Some(match self.passthrough_until {
-            Some(old) => old.min(expiry),
-            None => expiry,
-        });
+    pub(crate) fn transition_to_passthrough(&mut self, mode: PassthroughMode) {
+        self.passthrough.apply(mode);
     }
 
     pub(crate) fn decrypt(
@@ -224,9 +216,9 @@ impl Decryptor {
             output.extend_from_slice(encrypted_frame);
             return Ok(encrypted_frame.len());
         }
-        let parsed = crate::frame::parse_frame(encrypted_frame, &mut self.frame_parse_scratch)?;
+        let parsed = self.frame_parse_scratch.parse(encrypted_frame)?;
         if !parsed.encrypted {
-            if self.can_passthrough() {
+            if self.passthrough.allows_plaintext() {
                 output.clear();
                 output.extend_from_slice(encrypted_frame);
                 return Ok(encrypted_frame.len());
@@ -260,11 +252,6 @@ impl Decryptor {
         })
     }
 
-    fn can_passthrough(&self) -> bool {
-        self.passthrough_until
-            .is_none_or(|expiry| expiry > Instant::now())
-    }
-
     fn update_manager_expiry(&mut self, duration: Duration) {
         let expiry = self.clock.elapsed() + duration;
         for manager in &mut self.managers {
@@ -284,6 +271,35 @@ struct ExpiringCipher {
     expiry: Option<Duration>,
 }
 
+#[derive(Default)]
+struct MissingNonceWindow {
+    order: VecDeque<u64>,
+    members: HashSet<u64>,
+}
+
+impl MissingNonceWindow {
+    fn contains(&self, nonce: u64) -> bool {
+        self.members.contains(&nonce)
+    }
+
+    fn remove(&mut self, nonce: u64) {
+        self.members.remove(&nonce);
+    }
+
+    fn prune_before(&mut self, oldest: u64) {
+        while self.order.front().is_some_and(|nonce| *nonce < oldest) {
+            let nonce = self.order.pop_front().expect("front checked");
+            self.members.remove(&nonce);
+        }
+    }
+
+    fn push_back(&mut self, nonce: u64) {
+        if self.members.insert(nonce) {
+            self.order.push_back(nonce);
+        }
+    }
+}
+
 struct CryptorManager {
     clock: Instant,
     ratchet: HashRatchet,
@@ -293,7 +309,7 @@ struct CryptorManager {
     oldest_generation: u32,
     newest_generation: u32,
     newest_nonce: Option<u64>,
-    missing_nonces: VecDeque<u64>,
+    missing_nonces: MissingNonceWindow,
 }
 
 impl CryptorManager {
@@ -307,7 +323,7 @@ impl CryptorManager {
             oldest_generation: 0,
             newest_generation: 0,
             newest_nonce: None,
-            missing_nonces: VecDeque::new(),
+            missing_nonces: MissingNonceWindow::default(),
         }
     }
 
@@ -365,27 +381,13 @@ impl CryptorManager {
             None => self.newest_nonce = Some(wrapped_nonce),
             Some(newest) if wrapped_nonce > newest => {
                 let oldest_missing = wrapped_nonce.saturating_sub(MAX_MISSING_NONCES);
-                while self
-                    .missing_nonces
-                    .front()
-                    .is_some_and(|nonce| *nonce < oldest_missing)
-                {
-                    self.missing_nonces.pop_front();
-                }
+                self.missing_nonces.prune_before(oldest_missing);
                 for missing in max(oldest_missing, newest + 1)..wrapped_nonce {
                     self.missing_nonces.push_back(missing);
                 }
                 self.newest_nonce = Some(wrapped_nonce);
             }
-            Some(_) => {
-                if let Some(index) = self
-                    .missing_nonces
-                    .iter()
-                    .position(|missing| *missing == wrapped_nonce)
-                {
-                    self.missing_nonces.remove(index);
-                }
-            }
+            Some(_) => self.missing_nonces.remove(wrapped_nonce),
         }
 
         if generation <= self.newest_generation || !self.ciphers.contains_key(&generation) {
@@ -403,7 +405,7 @@ impl CryptorManager {
     fn can_process_nonce(&self, generation: u32, nonce: u32) -> bool {
         let wrapped = wrapped_nonce(generation, nonce);
         self.newest_nonce
-            .is_none_or(|newest| wrapped > newest || self.missing_nonces.contains(&wrapped))
+            .is_none_or(|newest| wrapped > newest || self.missing_nonces.contains(wrapped))
     }
 
     fn cleanup_expired_ciphers(&mut self) {
@@ -497,7 +499,7 @@ mod tests {
         },
     };
 
-    use super::{Decryptor, Encryptor, HashRatchet};
+    use super::{Decryptor, Encryptor, HashRatchet, MissingNonceWindow, PassthroughMode};
 
     #[test]
     fn hash_ratchet_matches_reference_vector() {
@@ -513,6 +515,21 @@ mod tests {
             ],
         );
         assert_eq!(nonce, &[48, 30, 95, 75, 116, 9, 15, 152, 94, 114, 107, 178]);
+    }
+
+    #[test]
+    fn missing_nonce_window_removes_members_without_disturbing_eviction_order() {
+        let mut window = MissingNonceWindow::default();
+
+        window.push_back(10);
+        window.push_back(11);
+        window.push_back(12);
+        window.remove(11);
+        window.prune_before(12);
+
+        assert!(!window.contains(10));
+        assert!(!window.contains(11));
+        assert!(window.contains(12));
     }
 
     #[test]
@@ -661,7 +678,7 @@ mod tests {
             Err(FrameDecryptError::PassthroughDisabled)
         );
 
-        decryptor.transition_to_passthrough(true, Duration::ZERO);
+        decryptor.transition_to_passthrough(PassthroughMode::enabled());
         decryptor
             .decrypt(MediaType::Audio, &frame, &mut decrypted)
             .unwrap();
@@ -669,10 +686,11 @@ mod tests {
     }
 
     #[test]
-    fn finite_passthrough_window_does_not_open_disabled_passthrough() {
+    fn disabled_after_does_not_open_disabled_plaintext_passthrough() {
         let mut decryptor = Decryptor::default();
         let mut decrypted = Vec::new();
-        decryptor.transition_to_passthrough(false, Duration::from_secs(10));
+        decryptor
+            .transition_to_passthrough(PassthroughMode::disabled_after(Duration::from_secs(10)));
 
         assert_eq!(
             decryptor.decrypt(MediaType::Audio, b"plain opus", &mut decrypted),
@@ -681,12 +699,13 @@ mod tests {
     }
 
     #[test]
-    fn finite_passthrough_window_replaces_permanent_passthrough() {
+    fn disabled_after_bounds_permanent_plaintext_passthrough() {
         let mut decryptor = Decryptor::default();
-        decryptor.transition_to_passthrough(true, Duration::ZERO);
-        decryptor.transition_to_passthrough(false, Duration::from_secs(10));
+        decryptor.transition_to_passthrough(PassthroughMode::enabled());
+        decryptor
+            .transition_to_passthrough(PassthroughMode::disabled_after(Duration::from_secs(10)));
 
-        assert!(decryptor.can_passthrough());
-        assert!(decryptor.passthrough_until.is_some());
+        assert!(decryptor.passthrough.allows_plaintext());
+        assert!(decryptor.passthrough.until().is_some());
     }
 }

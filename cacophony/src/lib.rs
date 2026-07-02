@@ -26,6 +26,7 @@ type GatewayWebSocketRead = SplitStream<GatewayWebSocketStream>;
 type GatewayWebSocketWrite = SplitSink<GatewayWebSocketStream, WsMessage>;
 
 mod buffer;
+pub mod codecs;
 mod connection;
 mod dave;
 mod errors;
@@ -35,16 +36,19 @@ mod observer;
 pub mod opus;
 pub mod pcm;
 mod queue;
+mod rtp;
+mod rtp_payload;
+mod secrets;
 mod state;
 mod stats;
 
-pub use ::dave::MediaType;
+pub use ::dave::{Codec, IdentityKeyError, IdentityKeyPersistence, MediaType};
 pub use connection::{
-    Connection, DurationDistribution, FrameStream, OpusPlayout, OpusPlayoutStats,
+    Connection, ConnectionConnect, DurationDistribution, FrameStream, OpusPlayout, OpusPlayoutStats,
 };
 pub use dave::{
-    DaveGatewayStateEvent, DaveIgnoredProposalsEvent, DaveKeyPackageEvent, DaveMediaStatus,
-    DaveProposalsEvent, DaveTransitionEvent,
+    DaveGatewayStateEvent, DaveIdentityKey, DaveIgnoredProposalsEvent, DaveKeyPackageEvent,
+    DaveMediaStatus, DaveProposalsEvent, DaveTransitionEvent,
 };
 pub use errors::{
     BackpressureError, ConnectionJoinError, DaveDecryptError, DaveError, DaveGatewayPayloadError,
@@ -54,7 +58,8 @@ pub use errors::{
 };
 pub use gateway::{SpeakingFlags, SpeakingUpdate};
 pub use media::{
-    DecodedFrame, DecodedFrameMetadata, FrameRaw, NoRawPackets, OutboundPacket, ReceivedFrame,
+    DecodedFrame, DecodedFrameMetadata, DecodedPcmLayout, FrameRaw, NoRawPackets, OutboundPacket,
+    ReceivedFrame, RtpSizeNonceSuffix,
 };
 pub use observer::{
     ClientsConnectedEvent, ConnectStage, ConnectStageCompletedEvent, ConnectStageFailedEvent,
@@ -65,18 +70,18 @@ pub use observer::{
     UdpPacketReceivedEvent, UdpPacketSentEvent, WebSocketBinaryEvent, WebSocketCloseFrame,
     WebSocketClosedEvent, WebSocketCommandFailedEvent, WebSocketFrameKind, WebSocketTextEvent,
 };
+pub use rtp::RtpPayloadType;
 pub use state::{
-    ConnectionConfig, ConnectionInfo, ConnectionOptions, ConnectionRequest, ConnectionState,
-    ConnectionStateSnapshot, ConnectionTuning, DaveMlsState, DavePendingMlsState, DaveState,
-    EncryptionMode, SessionState, ValidatedConnectionConfig,
+    ConnectionCodecPreferences, ConnectionConfig, ConnectionInfo, ConnectionOptions,
+    ConnectionRequest, ConnectionState, ConnectionStateSnapshot, ConnectionTuning, DaveMlsState,
+    DavePendingMlsState, DaveState, EncryptionMode, OfferedEncryptionMode, SessionState,
+    ValidatedConnectionConfig, ValidatedConnectionOptions, VideoCodecPreferences,
 };
 
 pub mod low_level {
     pub use crate::gateway::{DiscordId, GatewayReady, UdpDiscoveryPacket};
-    pub use crate::media::{
-        EncryptedMediaCodec, MediaCodec, RawFramePackets, RawUdpPacket, RawUdpPacketInfo,
-        RtpHeader, RtpPayload, RtpPayloadCodec,
-    };
+    pub use crate::media::{RawFramePackets, RawUdpPacket, RawUdpPacketInfo, RtpHeader};
+    pub use crate::rtp::RtpPayloadType;
     pub use crate::state::SessionDescription;
 }
 

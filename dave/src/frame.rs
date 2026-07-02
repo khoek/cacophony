@@ -1,12 +1,13 @@
-use std::{marker::PhantomData, time::Duration};
+use std::{fmt, marker::PhantomData, time::Duration};
 
 use aead::KeyInit;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    codec::{AnnexBFrame, H26X_LONG_START_CODE, H26X_SHORT_START_SEQUENCE_BYTES},
     error::{EncryptError, FrameDecryptError},
     gcm::Aes128Gcm8,
-    leb128,
+    leb128::{DecodedUleb128, Uleb128},
 };
 
 pub const OPUS_SILENCE_FRAME: [u8; 3] = [0xF8, 0xFF, 0xFE];
@@ -34,14 +35,82 @@ pub enum MediaType {
     Video,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum Codec {
-    Opus,
-    Vp8,
-    Vp9,
-    H264,
-    H265,
-    Av1,
+impl MediaType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+impl fmt::Display for MediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+macro_rules! for_each_codec {
+    ($macro:ident) => {
+        $macro! {
+            (Opus, Opus, Audio, "Opus", process_fully_encrypted_frame, always_valid_processed_frame),
+            (Vp8, Vp8, Video, "VP8", process_vp8_frame, always_valid_processed_frame),
+            (Vp9, Vp9, Video, "VP9", process_fully_encrypted_frame, always_valid_processed_frame),
+            (H264, H264, Video, "H264", process_h264_frame, validate_h26x_encrypted_frame),
+            (H265, H265, Video, "H265", process_h265_frame, validate_h26x_encrypted_frame),
+            (Av1, Av1, Video, "AV1", process_av1_frame, always_valid_processed_frame),
+        }
+    };
+}
+
+macro_rules! define_codec_enum {
+    ($(($variant:ident, $marker:ident, $media_type:ident, $label:literal, $process:path, $validate:path),)+) => {
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        pub enum Codec {
+            $($variant,)+
+        }
+
+        impl Codec {
+            pub const ALL: [Self; define_codec_enum!(@count $($variant),+)] = [
+                $(Self::$variant,)+
+            ];
+
+            pub fn visit<V>(self, visitor: &mut V) -> V::Output
+            where
+                V: CodecVisitor,
+            {
+                match self {
+                    $(Self::$variant => visitor.visit::<$marker>(),)+
+                }
+            }
+
+            pub const fn media_type(self) -> MediaType {
+                match self {
+                    $(Self::$variant => MediaType::$media_type,)+
+                }
+            }
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_codec_enum!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => {
+        ()
+    };
+}
+
+for_each_codec!(define_codec_enum);
+
+impl fmt::Display for Codec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 mod sealed {
@@ -66,103 +135,53 @@ pub trait FrameCodec: sealed::Sealed + Copy + Send + Sync + 'static {
     const CODEC: Codec;
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Opus;
+pub trait H26xFrameCodec: FrameCodec {
+    const NAL_HEADER_BYTES: usize;
 
-impl sealed::Sealed for Opus {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_fully_encrypted_frame(frame, processor)
-    }
+    fn nal_type(header: u8) -> u8;
+    fn encrypted_payload_unencrypted_prefix(nalu: &[u8]) -> Option<usize>;
+    fn encrypts_payload(nal_type: u8) -> bool;
 }
 
-impl FrameCodec for Opus {
-    const MEDIA_TYPE: MediaType = MediaType::Audio;
-    const CODEC: Codec = Codec::Opus;
+pub trait CodecVisitor {
+    type Output;
+
+    fn visit<C>(&mut self) -> Self::Output
+    where
+        C: FrameCodec;
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Vp8;
+macro_rules! define_codec_markers {
+    ($(($variant:ident, $marker:ident, $media_type:ident, $label:literal, $process:path, $validate:path),)+) => {
+        $(
+            #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+            pub struct $marker;
 
-impl sealed::Sealed for Vp8 {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_vp8_frame(frame, processor)
-    }
+            impl sealed::Sealed for $marker {
+                fn process_frame(
+                    frame: &[u8],
+                    processor: &mut OutboundFrameProcessor,
+                ) -> FrameProcessResult {
+                    $process(frame, processor)
+                }
+
+                fn validate_processed_frame(
+                    processor: &OutboundFrameProcessor,
+                    encrypted_frame: &[u8],
+                ) -> bool {
+                    $validate(processor, encrypted_frame)
+                }
+            }
+
+            impl FrameCodec for $marker {
+                const MEDIA_TYPE: MediaType = MediaType::$media_type;
+                const CODEC: Codec = Codec::$variant;
+            }
+        )+
+    };
 }
 
-impl FrameCodec for Vp8 {
-    const MEDIA_TYPE: MediaType = MediaType::Video;
-    const CODEC: Codec = Codec::Vp8;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Vp9;
-
-impl sealed::Sealed for Vp9 {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_fully_encrypted_frame(frame, processor)
-    }
-}
-
-impl FrameCodec for Vp9 {
-    const MEDIA_TYPE: MediaType = MediaType::Video;
-    const CODEC: Codec = Codec::Vp9;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct H264;
-
-impl sealed::Sealed for H264 {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_h26x_frame::<H264Codec>(frame, processor)
-    }
-
-    fn validate_processed_frame(
-        processor: &OutboundFrameProcessor,
-        encrypted_frame: &[u8],
-    ) -> bool {
-        validate_h26x_encrypted_frame(processor, encrypted_frame)
-    }
-}
-
-impl FrameCodec for H264 {
-    const MEDIA_TYPE: MediaType = MediaType::Video;
-    const CODEC: Codec = Codec::H264;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct H265;
-
-impl sealed::Sealed for H265 {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_h26x_frame::<H265Codec>(frame, processor)
-    }
-
-    fn validate_processed_frame(
-        processor: &OutboundFrameProcessor,
-        encrypted_frame: &[u8],
-    ) -> bool {
-        validate_h26x_encrypted_frame(processor, encrypted_frame)
-    }
-}
-
-impl FrameCodec for H265 {
-    const MEDIA_TYPE: MediaType = MediaType::Video;
-    const CODEC: Codec = Codec::H265;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Av1;
-
-impl sealed::Sealed for Av1 {
-    fn process_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
-        process_av1_frame(frame, processor)
-    }
-}
-
-impl FrameCodec for Av1 {
-    const MEDIA_TYPE: MediaType = MediaType::Video;
-    const CODEC: Codec = Codec::Av1;
-}
+for_each_codec!(define_codec_markers);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MediaFrame<'a, C>
@@ -195,25 +214,55 @@ where
     pub fn payload(self) -> &'a [u8] {
         self.payload
     }
+
+    pub(crate) fn max_ciphertext_len(self) -> usize {
+        self.payload.len()
+            + TAG_BYTES
+            + Uleb128::new(u64::from(u32::MAX)).encoded_len()
+            + 1
+            + MARKER.len()
+            + TRANSFORM_PADDING_BYTES
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DynamicMediaFrame<'a> {
-    pub media_type: MediaType,
     pub codec: Codec,
     pub payload: &'a [u8],
 }
 
-pub(crate) enum TypedMediaFrame<'a> {
-    Opus(MediaFrame<'a, Opus>),
-    Vp8(MediaFrame<'a, Vp8>),
-    Vp9(MediaFrame<'a, Vp9>),
-    H264(MediaFrame<'a, H264>),
-    H265(MediaFrame<'a, H265>),
-    Av1(MediaFrame<'a, Av1>),
+macro_rules! define_typed_media_frame {
+    ($(($variant:ident, $marker:ident, $media_type:ident, $label:literal, $process:path, $validate:path),)+) => {
+        pub enum TypedMediaFrame<'a> {
+            $($variant(MediaFrame<'a, $marker>),)+
+        }
+
+        impl<'a> TypedMediaFrame<'a> {
+            pub fn visit<V>(self, visitor: &mut V) -> V::Output
+            where
+                V: TypedMediaFrameVisitor<'a>,
+            {
+                match self {
+                    $(Self::$variant(frame) => visitor.visit(frame),)+
+                }
+            }
+        }
+
+        impl<'a> DynamicMediaFrame<'a> {
+            pub fn typed(self) -> TypedMediaFrame<'a> {
+                match self.codec {
+                    $(
+                        Codec::$variant => {
+                            TypedMediaFrame::$variant(MediaFrame::<$marker>::new(self.payload))
+                        }
+                    )+
+                }
+            }
+        }
+    };
 }
 
-pub(crate) trait TypedMediaFrameVisitor<'a> {
+pub trait TypedMediaFrameVisitor<'a> {
     type Output;
 
     fn visit<C>(&mut self, frame: MediaFrame<'a, C>) -> Self::Output
@@ -221,55 +270,20 @@ pub(crate) trait TypedMediaFrameVisitor<'a> {
         C: FrameCodec;
 }
 
-impl<'a> TypedMediaFrame<'a> {
-    pub(crate) fn visit<V>(self, visitor: &mut V) -> V::Output
+impl<'a> DynamicMediaFrame<'a> {
+    pub fn new(codec: Codec, payload: &'a [u8]) -> Self {
+        Self { codec, payload }
+    }
+
+    pub fn visit<V>(self, visitor: &mut V) -> V::Output
     where
         V: TypedMediaFrameVisitor<'a>,
     {
-        match self {
-            Self::Opus(frame) => visitor.visit(frame),
-            Self::Vp8(frame) => visitor.visit(frame),
-            Self::Vp9(frame) => visitor.visit(frame),
-            Self::H264(frame) => visitor.visit(frame),
-            Self::H265(frame) => visitor.visit(frame),
-            Self::Av1(frame) => visitor.visit(frame),
-        }
+        self.typed().visit(visitor)
     }
 }
 
-impl<'a> DynamicMediaFrame<'a> {
-    pub fn new(media_type: MediaType, codec: Codec, payload: &'a [u8]) -> Self {
-        Self {
-            media_type,
-            codec,
-            payload,
-        }
-    }
-
-    pub(crate) fn typed(self) -> Option<TypedMediaFrame<'a>> {
-        match (self.media_type, self.codec) {
-            (MediaType::Audio, Codec::Opus) => {
-                Some(TypedMediaFrame::Opus(MediaFrame::<Opus>::new(self.payload)))
-            }
-            (MediaType::Video, Codec::Vp8) => {
-                Some(TypedMediaFrame::Vp8(MediaFrame::<Vp8>::new(self.payload)))
-            }
-            (MediaType::Video, Codec::Vp9) => {
-                Some(TypedMediaFrame::Vp9(MediaFrame::<Vp9>::new(self.payload)))
-            }
-            (MediaType::Video, Codec::H264) => {
-                Some(TypedMediaFrame::H264(MediaFrame::<H264>::new(self.payload)))
-            }
-            (MediaType::Video, Codec::H265) => {
-                Some(TypedMediaFrame::H265(MediaFrame::<H265>::new(self.payload)))
-            }
-            (MediaType::Video, Codec::Av1) => {
-                Some(TypedMediaFrame::Av1(MediaFrame::<Av1>::new(self.payload)))
-            }
-            _ => None,
-        }
-    }
-}
+for_each_codec!(define_typed_media_frame);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FrameProcessResult {
@@ -370,18 +384,6 @@ impl FrameCipher {
     }
 }
 
-pub(crate) fn max_ciphertext_len<C>(frame: MediaFrame<'_, C>) -> usize
-where
-    C: FrameCodec,
-{
-    frame.payload.len()
-        + TAG_BYTES
-        + leb128::size(u64::from(u32::MAX))
-        + 1
-        + MARKER.len()
-        + TRANSFORM_PADDING_BYTES
-}
-
 pub(crate) struct ParsedFrame<'frame, 'ranges> {
     pub(crate) encrypted: bool,
     pub(crate) truncated_nonce: u32,
@@ -393,6 +395,52 @@ pub(crate) struct ParsedFrame<'frame, 'ranges> {
 #[derive(Default)]
 pub(crate) struct FrameParseScratch {
     unencrypted_ranges: Vec<UnencryptedRange>,
+}
+
+impl FrameParseScratch {
+    pub(crate) fn parse<'frame, 'scratch>(
+        &'scratch mut self,
+        frame: &'frame [u8],
+    ) -> Result<ParsedFrame<'frame, 'scratch>, FrameDecryptError> {
+        if frame.len() < SUPPLEMENTAL_BASE_BYTES {
+            return Ok(plain_frame(frame));
+        }
+        if frame[frame.len() - MARKER.len()..] != MARKER {
+            return Ok(plain_frame(frame));
+        }
+
+        let supplemental_size = usize::from(frame[frame.len() - MARKER.len() - 1]);
+        if supplemental_size < SUPPLEMENTAL_BASE_BYTES || supplemental_size > frame.len() {
+            return Ok(plain_frame(frame));
+        }
+        let supplemental = &frame[frame.len() - supplemental_size..];
+        let tag = &supplemental[..TAG_BYTES];
+        let nonce_and_ranges = &supplemental[TAG_BYTES..supplemental.len() - MARKER.len() - 1];
+        let Some(truncated_nonce) = DecodedUleb128::read(nonce_and_ranges) else {
+            return Ok(plain_frame(frame));
+        };
+        if truncated_nonce.value() > u64::from(u32::MAX) {
+            return Ok(plain_frame(frame));
+        }
+        let interleaved_frame = &frame[..frame.len() - supplemental_size];
+        match parse_unencrypted_ranges(
+            &nonce_and_ranges[truncated_nonce.encoded_len()..],
+            interleaved_frame.len(),
+            &mut self.unencrypted_ranges,
+        ) {
+            Ok(()) => {}
+            Err(FrameDecryptError::MalformedFrame) => return Ok(plain_frame(frame)),
+            Err(error) => return Err(error),
+        }
+
+        Ok(ParsedFrame {
+            encrypted: true,
+            truncated_nonce: truncated_nonce.value() as u32,
+            interleaved_frame,
+            unencrypted_ranges: &self.unencrypted_ranges,
+            tag,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -522,6 +570,13 @@ impl OutboundFrameProcessor {
         self.ciphertext.resize(self.encrypted_bytes.len(), 0);
     }
 
+    pub(crate) fn validate_processed<C>(&self, encrypted_frame: &[u8]) -> bool
+    where
+        C: FrameCodec,
+    {
+        <C as sealed::Sealed>::validate_processed_frame(self, encrypted_frame)
+    }
+
     #[cfg(test)]
     fn unencrypted_ranges(&self) -> usize {
         self.unencrypted_ranges.len()
@@ -585,50 +640,6 @@ fn plain_frame(frame: &[u8]) -> ParsedFrame<'_, 'static> {
     }
 }
 
-pub(crate) fn parse_frame<'frame, 'scratch>(
-    frame: &'frame [u8],
-    scratch: &'scratch mut FrameParseScratch,
-) -> Result<ParsedFrame<'frame, 'scratch>, FrameDecryptError> {
-    if frame.len() < SUPPLEMENTAL_BASE_BYTES {
-        return Ok(plain_frame(frame));
-    }
-    if frame[frame.len() - MARKER.len()..] != MARKER {
-        return Ok(plain_frame(frame));
-    }
-
-    let supplemental_size = usize::from(frame[frame.len() - MARKER.len() - 1]);
-    if supplemental_size < SUPPLEMENTAL_BASE_BYTES || supplemental_size > frame.len() {
-        return Ok(plain_frame(frame));
-    }
-    let supplemental = &frame[frame.len() - supplemental_size..];
-    let tag = &supplemental[..TAG_BYTES];
-    let nonce_and_ranges = &supplemental[TAG_BYTES..supplemental.len() - MARKER.len() - 1];
-    let Some((truncated_nonce, nonce_len)) = leb128::read(nonce_and_ranges) else {
-        return Ok(plain_frame(frame));
-    };
-    if truncated_nonce > u64::from(u32::MAX) {
-        return Ok(plain_frame(frame));
-    }
-    let interleaved_frame = &frame[..frame.len() - supplemental_size];
-    match parse_unencrypted_ranges(
-        &nonce_and_ranges[nonce_len..],
-        interleaved_frame.len(),
-        &mut scratch.unencrypted_ranges,
-    ) {
-        Ok(()) => {}
-        Err(FrameDecryptError::MalformedFrame) => return Ok(plain_frame(frame)),
-        Err(error) => return Err(error),
-    }
-
-    Ok(ParsedFrame {
-        encrypted: true,
-        truncated_nonce: truncated_nonce as u32,
-        interleaved_frame,
-        unencrypted_ranges: &scratch.unencrypted_ranges,
-        tag,
-    })
-}
-
 fn parse_unencrypted_ranges(
     mut bytes: &[u8],
     frame_len: usize,
@@ -637,17 +648,18 @@ fn parse_unencrypted_ranges(
     ranges.clear();
     let mut previous_end = 0;
     while !bytes.is_empty() {
-        let Some((offset, offset_len)) = leb128::read(bytes) else {
+        let Some(offset) = DecodedUleb128::read(bytes) else {
             return Err(FrameDecryptError::MalformedFrame);
         };
-        bytes = &bytes[offset_len..];
-        let Some((len, len_len)) = leb128::read(bytes) else {
+        bytes = &bytes[offset.encoded_len()..];
+        let Some(len) = DecodedUleb128::read(bytes) else {
             return Err(FrameDecryptError::MalformedFrame);
         };
-        bytes = &bytes[len_len..];
+        bytes = &bytes[len.encoded_len()..];
 
-        let offset = usize::try_from(offset).map_err(|_| FrameDecryptError::MalformedFrame)?;
-        let len = usize::try_from(len).map_err(|_| FrameDecryptError::MalformedFrame)?;
+        let offset =
+            usize::try_from(offset.value()).map_err(|_| FrameDecryptError::MalformedFrame)?;
+        let len = usize::try_from(len.value()).map_err(|_| FrameDecryptError::MalformedFrame)?;
         let end = offset
             .checked_add(len)
             .ok_or(FrameDecryptError::MalformedFrame)?;
@@ -671,24 +683,25 @@ fn write_supplemental_tail(
     ranges: &[UnencryptedRange],
     output: &mut Vec<u8>,
 ) -> Result<(), EncryptError> {
-    let nonce_size = leb128::size(u64::from(truncated_nonce));
+    let nonce = Uleb128::new(u64::from(truncated_nonce));
+    let nonce_size = nonce.encoded_len();
     let ranges_size = unencrypted_ranges_size(ranges);
     let supplemental_size = TAG_BYTES + nonce_size + ranges_size + 1 + MARKER.len();
     let supplemental_size =
         u8::try_from(supplemental_size).map_err(|_| EncryptError::SupplementalDataTooLarge)?;
     let start = output.len();
     output.resize(start + nonce_size + ranges_size + 1 + MARKER.len(), 0);
-    leb128::write(
-        u64::from(truncated_nonce),
-        &mut output[start..start + nonce_size],
-    )
-    .ok_or(EncryptError::FrameEncoding)?;
+    nonce
+        .write_to(&mut output[start..start + nonce_size])
+        .ok_or(EncryptError::FrameEncoding)?;
     let mut offset = start + nonce_size;
     for range in ranges {
-        let written = leb128::write(range.offset as u64, &mut output[offset..])
+        let written = Uleb128::new(range.offset as u64)
+            .write_to(&mut output[offset..])
             .ok_or(EncryptError::FrameEncoding)?;
         offset += written;
-        let written = leb128::write(range.len as u64, &mut output[offset..])
+        let written = Uleb128::new(range.len as u64)
+            .write_to(&mut output[offset..])
             .ok_or(EncryptError::FrameEncoding)?;
         offset += written;
     }
@@ -700,7 +713,10 @@ fn write_supplemental_tail(
 fn unencrypted_ranges_size(ranges: &[UnencryptedRange]) -> usize {
     ranges
         .iter()
-        .map(|range| leb128::size(range.offset as u64) + leb128::size(range.len as u64))
+        .map(|range| {
+            Uleb128::new(range.offset as u64).encoded_len()
+                + Uleb128::new(range.len as u64).encoded_len()
+        })
         .sum()
 }
 
@@ -725,27 +741,14 @@ fn process_vp8_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> Fr
     FrameProcessResult::Processed
 }
 
-pub(crate) fn validate_processed_frame<C>(
-    processor: &OutboundFrameProcessor,
-    encrypted_frame: &[u8],
-) -> bool
-where
-    C: FrameCodec,
-{
-    <C as sealed::Sealed>::validate_processed_frame(processor, encrypted_frame)
+fn always_valid_processed_frame(
+    _processor: &OutboundFrameProcessor,
+    _encrypted_frame: &[u8],
+) -> bool {
+    true
 }
 
-trait H26xCodec {
-    const NAL_HEADER_BYTES: usize;
-
-    fn nal_type(header: u8) -> u8;
-    fn encrypted_payload_unencrypted_prefix(nalu: &[u8]) -> Option<usize>;
-    fn encrypts_payload(nal_type: u8) -> bool;
-}
-
-struct H264Codec;
-
-impl H26xCodec for H264Codec {
+impl H26xFrameCodec for H264 {
     const NAL_HEADER_BYTES: usize = 1;
 
     fn nal_type(header: u8) -> u8 {
@@ -765,9 +768,7 @@ impl H26xCodec for H264Codec {
     }
 }
 
-struct H265Codec;
-
-impl H26xCodec for H265Codec {
+impl H26xFrameCodec for H265 {
     const NAL_HEADER_BYTES: usize = 2;
 
     fn nal_type(header: u8) -> u8 {
@@ -785,20 +786,29 @@ impl H26xCodec for H265Codec {
     }
 }
 
+fn process_h264_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
+    process_h26x_frame::<H264>(frame, processor)
+}
+
+fn process_h265_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult {
+    process_h26x_frame::<H265>(frame, processor)
+}
+
 fn process_h26x_frame<C>(frame: &[u8], processor: &mut OutboundFrameProcessor) -> FrameProcessResult
 where
-    C: H26xCodec,
+    C: H26xFrameCodec,
 {
     if frame.len() < H26X_SHORT_START_SEQUENCE_BYTES + C::NAL_HEADER_BYTES {
         return FrameProcessResult::FallbackAllEncrypted;
     }
-    let Some(mut nalu) = find_next_h26x_nalu(frame, 0) else {
+    let annex_b = AnnexBFrame::new(frame);
+    let Some(mut nalu) = annex_b.find_next_nalu(0) else {
         return FrameProcessResult::FallbackAllEncrypted;
     };
     while nalu.start < frame.len().saturating_sub(1) {
         let nal_type = C::nal_type(frame[nalu.start]);
         processor.add_unencrypted_bytes(&H26X_LONG_START_CODE);
-        let next = find_next_h26x_nalu(frame, nalu.start);
+        let next = annex_b.find_next_nalu(nalu.start);
         let next_start = next
             .map(|next| next.start - next.start_code_len)
             .unwrap_or(frame.len());
@@ -851,11 +861,11 @@ fn process_av1_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> Fr
         }
 
         let payload_size = if has_size {
-            let Some((payload_size, size_len)) = leb128::read(&frame[index..]) else {
+            let Some(payload_size) = DecodedUleb128::read(&frame[index..]) else {
                 return FrameProcessResult::FallbackAllEncrypted;
             };
-            index += size_len;
-            let Ok(payload_size) = usize::try_from(payload_size) else {
+            index += payload_size.encoded_len();
+            let Ok(payload_size) = usize::try_from(payload_size.value()) else {
                 return FrameProcessResult::FallbackAllEncrypted;
             };
             payload_size
@@ -888,7 +898,7 @@ fn process_av1_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> Fr
         }
         if has_size && !rewrite_without_size {
             let mut size_buffer = [0; 10];
-            let Some(written) = leb128::write(payload_size as u64, &mut size_buffer) else {
+            let Some(written) = Uleb128::new(payload_size as u64).write_to(&mut size_buffer) else {
                 return FrameProcessResult::FallbackAllEncrypted;
             };
             processor.add_unencrypted_bytes(&size_buffer[..written]);
@@ -896,43 +906,6 @@ fn process_av1_frame(frame: &[u8], processor: &mut OutboundFrameProcessor) -> Fr
         processor.add_encrypted_bytes(&frame[payload_index..payload_index + payload_size]);
     }
     FrameProcessResult::Processed
-}
-
-const H26X_LONG_START_CODE: [u8; 4] = [0, 0, 0, 1];
-const H26X_SHORT_START_SEQUENCE_BYTES: usize = 3;
-
-#[derive(Clone, Copy)]
-struct H26XNalu {
-    start: usize,
-    start_code_len: usize,
-}
-
-fn find_next_h26x_nalu(frame: &[u8], search_start: usize) -> Option<H26XNalu> {
-    if frame.len() < H26X_SHORT_START_SEQUENCE_BYTES {
-        return None;
-    }
-    let mut index = search_start;
-    while index < frame.len() - H26X_SHORT_START_SEQUENCE_BYTES {
-        if frame[index + 2] > 1 {
-            index += H26X_SHORT_START_SEQUENCE_BYTES;
-        } else if frame[index + 2] == 1 {
-            if frame[index] == 0 && frame[index + 1] == 0 {
-                let start_code_len = if index >= 1 && frame[index - 1] == 0 {
-                    4
-                } else {
-                    3
-                };
-                return Some(H26XNalu {
-                    start: index + H26X_SHORT_START_SEQUENCE_BYTES,
-                    start_code_len,
-                });
-            }
-            index += H26X_SHORT_START_SEQUENCE_BYTES;
-        } else {
-            index += 1;
-        }
-    }
-    None
 }
 
 fn bytes_covering_h264_pps(payload: &[u8]) -> Option<usize> {
@@ -981,7 +954,10 @@ fn validate_h26x_encrypted_frame(
         }
         let start = encrypted_section_start.saturating_sub(PADDING);
         let end = (range.offset + PADDING).min(encrypted_frame.len());
-        if find_next_h26x_nalu(&encrypted_frame[start..end], 0).is_some() {
+        if AnnexBFrame::new(&encrypted_frame[start..end])
+            .find_next_nalu(0)
+            .is_some()
+        {
             return false;
         }
         encrypted_section_start = range.end();
@@ -990,17 +966,19 @@ fn validate_h26x_encrypted_frame(
         return true;
     }
     let start = encrypted_section_start.saturating_sub(PADDING);
-    find_next_h26x_nalu(&encrypted_frame[start..], 0).is_none()
+    AnnexBFrame::new(&encrypted_frame[start..])
+        .find_next_nalu(0)
+        .is_none()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::leb128;
+    use crate::leb128::Uleb128;
 
     use super::{
         Av1, FrameCipher, FrameDecryptScratch, FrameParseScratch, H264, H265, InterleavedFramePlan,
         KEY_BYTES, MARKER, MediaFrame, Opus, OutboundFrameProcessor, TAG_BYTES, UnencryptedRange,
-        Vp8, Vp9, nonce_from_truncated, parse_frame,
+        Vp8, Vp9, nonce_from_truncated,
     };
 
     #[test]
@@ -1013,7 +991,7 @@ mod tests {
         let cipher = FrameCipher::new(&[7; KEY_BYTES]).unwrap();
         let frame = encrypted_frame_with_ranges(&cipher, 1, plaintext, &ranges);
         let mut parse_scratch = FrameParseScratch::default();
-        let parsed = parse_frame(&frame, &mut parse_scratch).unwrap();
+        let parsed = parse_scratch.parse(&frame).unwrap();
         let mut output = Vec::new();
         let mut scratch = FrameDecryptScratch::default();
 
@@ -1035,10 +1013,46 @@ mod tests {
         frame.extend_from_slice(&MARKER);
 
         assert!(
-            !parse_frame(&frame, &mut FrameParseScratch::default())
+            !FrameParseScratch::default()
+                .parse(&frame)
                 .unwrap()
                 .encrypted
         );
+    }
+
+    #[test]
+    fn malformed_overlong_nonce_fails_protocol_frame_check() {
+        let mut frame = b"abc".to_vec();
+        frame.extend_from_slice(&[0; TAG_BYTES]);
+        frame.extend_from_slice(&[0xff; 10]);
+        frame.push((TAG_BYTES + 10 + 1 + MARKER.len()) as u8);
+        frame.extend_from_slice(&MARKER);
+
+        assert!(
+            !FrameParseScratch::default()
+                .parse(&frame)
+                .unwrap()
+                .encrypted
+        );
+    }
+
+    #[test]
+    fn av1_overlong_obu_size_falls_back_to_full_encryption() {
+        let frame = [
+            0b0000_1010,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0x02,
+        ];
+
+        assert_partition::<Av1>(&frame, 0, frame.len());
     }
 
     #[test]
@@ -1116,16 +1130,19 @@ mod tests {
 
     fn push_leb128(value: u64, output: &mut Vec<u8>) {
         let start = output.len();
-        output.resize(start + leb128::size(value), 0);
-        leb128::write(value, &mut output[start..]).unwrap();
+        output.resize(start + Uleb128::new(value).encoded_len(), 0);
+        Uleb128::new(value).write_to(&mut output[start..]).unwrap();
     }
 
     fn supplemental_size(truncated_nonce: u32, ranges: &[UnencryptedRange]) -> usize {
         TAG_BYTES
-            + leb128::size(u64::from(truncated_nonce))
+            + Uleb128::new(u64::from(truncated_nonce)).encoded_len()
             + ranges
                 .iter()
-                .map(|range| leb128::size(range.offset as u64) + leb128::size(range.len as u64))
+                .map(|range| {
+                    Uleb128::new(range.offset as u64).encoded_len()
+                        + Uleb128::new(range.len as u64).encoded_len()
+                })
                 .sum::<usize>()
             + 1
             + MARKER.len()

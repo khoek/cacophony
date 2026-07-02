@@ -22,6 +22,7 @@ openmls_basic_credential = "0.5"
 openmls_rust_crypto = "0.5"
 p256 = "0.13"
 rand = "0.10"
+scrypt = "0.12.0"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 subtle = "2"

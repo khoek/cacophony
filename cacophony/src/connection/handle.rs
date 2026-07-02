@@ -11,12 +11,15 @@ use tokio::{
     task::JoinHandle,
 };
 
+use dave::Codec;
+
 use crate::{
     dave::DaveMediaStatus,
     errors::{BackpressureError, ConnectionJoinError, Error, InvalidInputError, Result},
     gateway::SpeakingFlags,
     media::{
-        DecodedFrame, DecodedFrameMetadata, FrameRaw, NoRawPackets, RawUdpPacket, ReceivedFrame,
+        DecodedFrame, DecodedFrameMetadata, FrameRaw, NoRawPackets, OutboundPacket, RawUdpPacket,
+        ReceivedFrame,
     },
     observer::{
         ConnectionObserver, NoopConnectionObserver, ReceiveDecodeContext, ReceiveDecodeErrorKind,
@@ -24,7 +27,7 @@ use crate::{
     },
     opus::Decoder,
     queue::DriverReply,
-    state::{ConnectionInternalState, ConnectionState, ConnectionStateSnapshot, DaveMlsState},
+    state::{ConnectionInternalState, ConnectionStateSnapshot, DaveMlsState},
 };
 
 use super::{FrameReceiveResult, LowLevelReceiveKind, OpusPlayout, PlayoutCommand};
@@ -242,7 +245,7 @@ where
         {
             return status;
         }
-        dave_media_status_from_public_state(&self.state())
+        DaveMediaStatus::from_public_state(&self.state())
     }
 
     pub async fn wait_until_media_ready(&self, max_wait: Duration) -> Result<DaveMediaStatus> {
@@ -298,6 +301,21 @@ where
         self.send_command(ConnectionCommand::<Raw>::SetSpeaking { flags, delay })
     }
 
+    pub async fn send_encoded_media_frame(
+        &self,
+        codec: Codec,
+        frame: impl Into<Vec<u8>>,
+        duration: Duration,
+    ) -> Result<OutboundPacket> {
+        self.request_result(|response| ConnectionCommand::<Raw>::SendMediaFrame {
+            codec,
+            frame: frame.into(),
+            duration,
+            response: DriverReply::new(response),
+        })
+        .await
+    }
+
     pub async fn start_opus_playout(&self) -> Result<OpusPlayout> {
         self.ensure_open()?;
         let (response, receive) = oneshot::channel();
@@ -345,7 +363,7 @@ where
 {
     pub async fn recv(&mut self) -> Result<ReceivedFrame<Raw>> {
         let result = self.frames.recv().await.ok_or(Error::Closed)?;
-        super::limit_voice_frame_result(result, self.max_frame_len)
+        result.and_then(|frame| frame.ensure_len_at_most(self.max_frame_len))
     }
 
     pub async fn recv_timeout(&mut self, max_wait: Duration) -> Result<Option<ReceivedFrame<Raw>>> {
@@ -357,23 +375,7 @@ where
 
     pub async fn recv_decoded(&mut self, decoder: &mut Decoder) -> Result<DecodedFrame<Raw>> {
         let frame = self.recv().await?;
-        let ssrc = frame.rtp.ssrc;
-        let user_id = frame.user_id;
-        let seq = frame.rtp.seq;
-        match decoder.decode_frame(frame) {
-            Ok(decoded) => Ok(decoded),
-            Err(error) => {
-                self.observe_decode_error(
-                    ReceiveDecodeStage::Opus,
-                    ReceiveDecodeErrorKind::OpusDecodeFailed,
-                    Some(ssrc),
-                    user_id,
-                    Some(seq),
-                    &error,
-                );
-                Err(error)
-            }
-        }
+        self.decode_frame_observed(frame, |frame| decoder.decode_frame(frame))
     }
 
     pub async fn recv_decoded_timeout(
@@ -384,23 +386,8 @@ where
         let Some(frame) = self.recv_timeout(max_wait).await? else {
             return Ok(None);
         };
-        let ssrc = frame.rtp.ssrc;
-        let user_id = frame.user_id;
-        let seq = frame.rtp.seq;
-        match decoder.decode_frame(frame) {
-            Ok(decoded) => Ok(Some(decoded)),
-            Err(error) => {
-                self.observe_decode_error(
-                    ReceiveDecodeStage::Opus,
-                    ReceiveDecodeErrorKind::OpusDecodeFailed,
-                    Some(ssrc),
-                    user_id,
-                    Some(seq),
-                    &error,
-                );
-                Err(error)
-            }
-        }
+        self.decode_frame_observed(frame, |frame| decoder.decode_frame(frame))
+            .map(Some)
     }
 
     pub async fn recv_decoded_into(
@@ -409,10 +396,18 @@ where
         pcm: &mut Vec<i16>,
     ) -> Result<DecodedFrameMetadata<Raw>> {
         let frame = self.recv().await?;
+        self.decode_frame_observed(frame, |frame| decoder.decode_frame_into(frame, pcm))
+    }
+
+    fn decode_frame_observed<T>(
+        &self,
+        frame: ReceivedFrame<Raw>,
+        decode: impl FnOnce(ReceivedFrame<Raw>) -> Result<T>,
+    ) -> Result<T> {
         let ssrc = frame.rtp.ssrc;
         let user_id = frame.user_id;
         let seq = frame.rtp.seq;
-        match decoder.decode_frame_into(frame, pcm) {
+        match decode(frame) {
             Ok(decoded) => Ok(decoded),
             Err(error) => {
                 self.observe_decode_error(
@@ -473,6 +468,12 @@ where
         max_wait: Duration,
         response: DriverReply<DaveMediaStatus>,
     },
+    SendMediaFrame {
+        codec: Codec,
+        frame: Vec<u8>,
+        duration: Duration,
+        response: DriverReply<OutboundPacket>,
+    },
     Close,
 }
 
@@ -490,7 +491,7 @@ where
             }
             Self::DaveMediaStatus { response } => {
                 let _ = response.send(DaveMediaStatus {
-                    active: false,
+                    requires_dave: false,
                     active_send_protocol_version: None,
                     active_receive_protocol_version: None,
                     media_ready: false,
@@ -505,23 +506,10 @@ where
             Self::WaitUntilMediaReady { response, .. } => {
                 response.complete_closed();
             }
+            Self::SendMediaFrame { response, .. } => {
+                response.complete_closed();
+            }
             Self::SetSpeaking { .. } | Self::Close => {}
         }
-    }
-}
-
-pub(crate) fn dave_media_status_from_public_state(state: &ConnectionState) -> DaveMediaStatus {
-    let active = state.dave.active_send_protocol_version.unwrap_or(0) > 0;
-    DaveMediaStatus {
-        active,
-        active_send_protocol_version: state.dave.active_send_protocol_version,
-        active_receive_protocol_version: state.dave.active_receive_protocol_version,
-        media_ready: !active,
-        session_ready: false,
-        send_ready: false,
-        transition_ready: None,
-        protocol_version: state.dave.protocol_version,
-        transition_id: state.dave.transition_id,
-        mls: state.dave.mls,
     }
 }

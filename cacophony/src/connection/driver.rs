@@ -16,20 +16,19 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::{
     CONNECT_TIMEOUT, GatewayWebSocketRead, GatewayWebSocketWrite, HELLO_TIMEOUT, READY_TIMEOUT,
     SESSION_DESCRIPTION_TIMEOUT, UDP_DISCOVERY_TIMEOUT,
-    dave::{
-        DaveCoordinator, DaveMediaStatus, dave_gateway_media_ready, dave_send_active,
-        dave_send_media_ready, dave_transition_zero_media_ready,
-    },
+    codecs::DiscordRtpCodecMap,
+    dave::{DaveCoordinator, DaveMediaStatus},
     errors::{Error, ProtocolError, Result},
     gateway::{
-        GatewayCommand, GatewayEventEffects, GatewayReady, HeartbeatCommand, HelloData, Opcode,
-        SelectProtocolCommand, SpeakingCommand, UdpDiscoveryPacket, handle_voice_binary_event,
-        handle_voice_text_event, identify_payload, parse_data, parse_event_text, read_event,
-        replay_pending_voice_events, wait_for_opcode, wait_for_session_description,
+        GatewayCommand, GatewayEventEffects, GatewayEventHandler, GatewayHeartbeatAckState,
+        GatewayReady, HeartbeatCommand, HelloData, Opcode, SelectProtocolCommand, SpeakingCommand,
+        UdpDiscoveryPacket, handle_voice_binary_event, identify_payload, parse_data,
+        parse_event_text, read_event, replay_pending_voice_events, wait_for_opcode,
+        wait_for_session_description,
     },
     media::{
-        FrameRaw, NoRawPackets, TransportCrypto, bind_udp_socket, connect_websocket,
-        initial_heartbeat_nonce, next_heartbeat_nonce, select_encryption_mode, update_state,
+        FrameRaw, HeartbeatNonce, NoRawPackets, OutboundPacket, TransportCrypto, VoiceEndpoint,
+        VoiceUdpRemote,
     },
     observer::{
         ConnectStage, ConnectStageCompletedEvent, ConnectStageFailedEvent, ConnectionErrorEvent,
@@ -55,6 +54,14 @@ pub(crate) struct PendingMediaReadyWait {
     max_wait: Duration,
 }
 
+pub(crate) struct PendingMediaFrameSend {
+    codec: ::dave::Codec,
+    frame: Vec<u8>,
+    duration: Duration,
+    response: DriverReply<OutboundPacket>,
+    max_wait: Duration,
+}
+
 pub(crate) struct ConnectionDriver<O, Raw>
 where
     O: ConnectionObserver,
@@ -73,6 +80,7 @@ where
     pub(super) send: SendPipeline,
     pub(super) transport_crypto: TransportCrypto,
     pub(super) pending_media_ready_waits: DeadlineQueue<PendingMediaReadyWait>,
+    pub(super) pending_media_ready_sends: DeadlineQueue<PendingMediaFrameSend>,
 }
 
 impl<O, Raw> ConnectionDriver<O, Raw>
@@ -101,50 +109,51 @@ where
             self.state.internal().heartbeat_interval_ms,
         ));
         heartbeat.tick().await;
-        let mut heartbeat_nonce = initial_heartbeat_nonce();
-        let mut heartbeat_ack_pending = false;
-        let mut heartbeat_sent_at: Option<Instant> = None;
+        let mut heartbeat_nonce = HeartbeatNonce::initial()?;
+        let mut heartbeat_ack = GatewayHeartbeatAckState::default();
         let heartbeat_ack_timeout =
             heartbeat_ack_timeout(self.state.internal().heartbeat_interval_ms);
         let mut close_rx = self.close.subscribe();
 
         self.pump_dave().await?;
-        self.resolve_pending_media_ready_waits();
+        self.resolve_pending_media_ready(&mut close_rx).await;
 
         loop {
-            self.discard_inactive_pending_receives();
+            self.receive.discard_closed_packet_receives();
             self.flush_frame_stream();
-            self.discard_inactive_pending_receives();
-            self.resolve_pending_media_ready_waits();
+            self.resolve_pending_media_ready(&mut close_rx).await;
             self.resolve_active_playout(&mut close_rx).await?;
 
             self.receive.udp_buffer.resize(
-                self.state.internal().config.tuning.udp_receive_buffer_bytes,
+                self.state
+                    .internal()
+                    .config
+                    .options
+                    .tuning
+                    .udp_receive_buffer_bytes
+                    .get(),
                 0,
             );
             let wake_deadline = self.next_driver_wake_deadline();
 
             tokio::select! {
                 _ = heartbeat.tick() => {
-                    if heartbeat_ack_pending {
-                        if heartbeat_sent_at.is_some_and(|sent_at| {
-                            sent_at.elapsed() >= heartbeat_ack_timeout
-                        }) {
+                    if heartbeat_ack.is_pending() {
+                        if heartbeat_ack.timed_out(heartbeat_ack_timeout) {
                             return Err(Error::Protocol(ProtocolError::HeartbeatAckTimeout));
                         }
                         continue;
                     }
                     let heartbeat_command = GatewayCommand::Heartbeat(HeartbeatCommand {
-                        t: next_heartbeat_nonce(&mut heartbeat_nonce),
+                        t: heartbeat_nonce.next(),
                         seq_ack: self.state.internal().last_seq,
                     });
                     self.send_voice_gateway_command(heartbeat_command).await?;
-                    heartbeat_ack_pending = true;
-                    heartbeat_sent_at = Some(Instant::now());
+                    heartbeat_ack.mark_sent(Instant::now());
                 }
                 command = self.command_rx.recv() => {
                     match command {
-                        Some(command) => self.handle_command(command).await?,
+                        Some(command) => self.handle_command(command, &mut close_rx).await?,
                         None => {
                             self.close.close();
                             let _ = self.write.send(WsMessage::Close(None)).await;
@@ -190,15 +199,14 @@ where
                     let Some(effects) = self
                         .handle_websocket_message(
                             message,
-                            &mut heartbeat_ack_pending,
-                            &mut heartbeat_sent_at,
+                            &mut heartbeat_ack,
                         )
                         .await?
                     else {
                         break;
                     };
                     self.pump_dave().await?;
-                    self.resolve_pending_media_ready_waits();
+                    self.resolve_pending_media_ready(&mut close_rx).await;
                     self.retry_pending_dave_media(effects.retry_dave_pending_media);
                     self.collect_ready_voice_frames();
                     self.flush_frame_stream();
@@ -210,7 +218,11 @@ where
         Ok(())
     }
 
-    async fn handle_command(&mut self, command: ConnectionCommand<Raw>) -> Result<()> {
+    async fn handle_command(
+        &mut self,
+        command: ConnectionCommand<Raw>,
+        close_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         match command {
             ConnectionCommand::SetSpeaking { flags, delay } => {
                 let ssrc = self.state.internal().ready.ssrc;
@@ -255,6 +267,30 @@ where
                 );
                 self.resolve_pending_media_ready_waits();
             }
+            ConnectionCommand::SendMediaFrame {
+                codec,
+                frame,
+                duration,
+                response,
+            } => {
+                let max_wait = self
+                    .state
+                    .internal()
+                    .config
+                    .options
+                    .dave_send_media_ready_timeout;
+                self.send_media_frame_when_ready(
+                    PendingMediaFrameSend {
+                        codec,
+                        frame,
+                        duration,
+                        response,
+                        max_wait,
+                    },
+                    close_rx,
+                )
+                .await;
+            }
             ConnectionCommand::Close => {
                 self.close.close();
                 let _ = self.write.send(WsMessage::Close(None)).await;
@@ -266,8 +302,7 @@ where
     async fn handle_websocket_message(
         &mut self,
         message: Option<std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>>,
-        heartbeat_ack_pending: &mut bool,
-        heartbeat_sent_at: &mut Option<Instant>,
+        heartbeat_ack: &mut GatewayHeartbeatAckState,
     ) -> Result<Option<GatewayEventEffects>> {
         let connection = self.state.internal().config.public_info();
         match message {
@@ -281,18 +316,17 @@ where
                     seq: event.seq,
                 });
                 if let Some(seq) = event.seq {
-                    update_state(&mut self.state, |state| {
+                    self.state.update(|state| {
                         state.last_seq = Some(seq);
                     });
                 }
-                let effects = handle_voice_text_event(
-                    &mut self.state,
-                    event,
-                    heartbeat_ack_pending,
-                    heartbeat_sent_at,
-                    &self.observer,
-                )?;
+                let effects =
+                    GatewayEventHandler::new(&mut self.state, heartbeat_ack, &self.observer)
+                        .handle_text_event(event)?;
                 self.apply_gateway_effects(&effects)?;
+                if effects.media_session_updated {
+                    self.send.update_negotiated_media(self.state.internal())?;
+                }
                 Ok(Some(effects))
             }
             Some(Ok(WsMessage::Binary(bytes))) => {
@@ -392,8 +426,8 @@ where
         if let Some(config) = &effects.transport_crypto {
             self.transport_crypto = TransportCrypto::from_config(config)?;
         }
-        if effects.allow_transition_receive_passthrough {
-            self.dave.allow_transition_receive_passthrough();
+        if effects.allow_plaintext_receive_grace {
+            self.dave.allow_plaintext_receive_grace();
         }
         if effects.removed_ssrcs.is_empty() {
             return Ok(());
@@ -425,36 +459,99 @@ where
             });
     }
 
+    async fn resolve_pending_media_ready(
+        &mut self,
+        close_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.resolve_pending_media_ready_waits();
+        self.resolve_pending_media_ready_sends(close_rx).await;
+    }
+
+    async fn resolve_pending_media_ready_sends(
+        &mut self,
+        close_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        if self.current_dave_media_status().media_ready {
+            let mut sends = Vec::new();
+            self.pending_media_ready_sends
+                .drain_all(|send| sends.push(send));
+            for send in sends {
+                self.complete_media_frame_send(send, close_rx).await;
+            }
+            return;
+        }
+
+        self.pending_media_ready_sends
+            .drain_expired(Instant::now(), |send| {
+                send.response.complete(Err(Error::Timeout {
+                    stage: None,
+                    duration: send.max_wait,
+                }));
+            });
+    }
+
+    async fn send_media_frame_when_ready(
+        &mut self,
+        send: PendingMediaFrameSend,
+        close_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        if self.current_dave_media_status().media_ready {
+            self.complete_media_frame_send(send, close_rx).await;
+            return;
+        }
+
+        let deadline = Instant::now() + send.max_wait;
+        self.pending_media_ready_sends.push(send, deadline);
+    }
+
+    async fn complete_media_frame_send(
+        &mut self,
+        send: PendingMediaFrameSend,
+        close_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) {
+        let result = self
+            .send_ready_media_frame(send.codec, &send.frame, send.duration, close_rx)
+            .await;
+        send.response.complete(result);
+    }
+
     pub(super) fn current_dave_media_status(&self) -> DaveMediaStatus {
         let state = self.state.internal();
-        let active = dave_send_active(&state.dave);
-        let gateway_ready = dave_gateway_media_ready(&state.dave);
+        let requires_dave = state.dave.send_requires_dave();
         let session_ready = self.dave.ready();
         let send_ready = self.dave.send_ready();
         let transition_ready = self.dave.transition_ready();
+        let gateway_ready = state.dave.gateway_media_ready()
+            || state.dave.transition_zero_media_ready(transition_ready);
         DaveMediaStatus {
-            active,
-            active_send_protocol_version: state.dave.active_send_protocol_version,
-            active_receive_protocol_version: state.dave.active_receive_protocol_version,
-            media_ready: dave_send_media_ready(active, session_ready, send_ready, gateway_ready),
+            requires_dave,
+            active_send_protocol_version: state.dave.active_send_protocol_version(),
+            active_receive_protocol_version: state.dave.active_receive_protocol_version(),
+            media_ready: DaveMediaStatus::ready_from(
+                requires_dave,
+                session_ready,
+                send_ready,
+                gateway_ready,
+            ),
             session_ready,
             send_ready,
             transition_ready,
-            protocol_version: state.dave.protocol_version,
-            transition_id: state.dave.transition_id,
+            protocol_version: state.dave.protocol_version(),
+            transition_id: state.dave.transition_id(),
             mls: state.dave.mls_state(),
         }
     }
 
-    pub(super) fn dave_send_active(&self) -> bool {
-        dave_send_active(&self.state.internal().dave)
+    pub(super) fn dave_send_requires_dave(&self) -> bool {
+        self.state.internal().dave.send_requires_dave()
     }
 
     pub(super) fn dave_decrypt_state_can_still_change(&self) -> bool {
         let state = self.state.internal();
-        let transition_zero_ready =
-            dave_transition_zero_media_ready(&state.dave, self.dave.transition_ready());
-        !self.dave.ready() || (!transition_zero_ready && !dave_gateway_media_ready(&state.dave))
+        let transition_zero_ready = state
+            .dave
+            .transition_zero_media_ready(self.dave.transition_ready());
+        !self.dave.ready() || (!transition_zero_ready && !state.dave.gateway_media_ready())
     }
 
     fn next_driver_wake_deadline(&self) -> Option<Instant> {
@@ -476,6 +573,7 @@ where
                     .and_then(ActiveOpusPlayout::dave_deadline),
             )
             .chain(self.pending_media_ready_waits.next_deadline())
+            .chain(self.pending_media_ready_sends.next_deadline())
             .min()
     }
 
@@ -493,83 +591,82 @@ where
         self.pending_media_ready_waits.drain_all(|wait| {
             wait.response.complete_closed();
         });
+        self.pending_media_ready_sends.drain_all(|send| {
+            send.response.complete_closed();
+        });
     }
 }
 
-impl ConnectionConfig {
-    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
-        self.validate()?.connect().await
-    }
-
-    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
+pub trait ConnectionConnect: Sized {
+    fn connect(
+        self,
+    ) -> impl Future<Output = Result<Connection<NoopConnectionObserver, NoRawPackets>>>
     where
-        O: ConnectionObserver,
+        Self: IntoValidatedConnectionConfig,
     {
-        self.validate()?.connect_with_observer(observer).await
+        connect_config_with_observer_and_raw(self, NoopConnectionObserver)
     }
 
-    pub async fn connect_with_observer_and_raw<O, Raw>(
+    fn connect_with_observer<O>(
         self,
         observer: O,
-    ) -> Result<Connection<O, Raw>>
+    ) -> impl Future<Output = Result<Connection<O, NoRawPackets>>>
     where
+        Self: IntoValidatedConnectionConfig,
+        O: ConnectionObserver,
+    {
+        connect_config_with_observer_and_raw(self, observer)
+    }
+
+    fn connect_with_observer_and_raw<O, Raw>(
+        self,
+        observer: O,
+    ) -> impl Future<Output = Result<Connection<O, Raw>>>
+    where
+        Self: IntoValidatedConnectionConfig,
         O: ConnectionObserver,
         Raw: FrameRaw,
     {
-        self.validate()?
-            .connect_with_observer_and_raw(observer)
-            .await
+        connect_config_with_observer_and_raw(self, observer)
     }
 }
 
-impl ConnectionRequest {
-    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
-        self.validate()?.connect().await
-    }
+impl<T> ConnectionConnect for T where T: IntoValidatedConnectionConfig {}
 
-    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
-    where
-        O: ConnectionObserver,
-    {
-        self.validate()?.connect_with_observer(observer).await
-    }
+#[doc(hidden)]
+pub trait IntoValidatedConnectionConfig {
+    fn into_validated_connection_config(self) -> Result<ValidatedConnectionConfig>;
+}
 
-    pub async fn connect_with_observer_and_raw<O, Raw>(
-        self,
-        observer: O,
-    ) -> Result<Connection<O, Raw>>
-    where
-        O: ConnectionObserver,
-        Raw: FrameRaw,
-    {
-        self.validate()?
-            .connect_with_observer_and_raw(observer)
-            .await
+impl IntoValidatedConnectionConfig for ConnectionConfig {
+    fn into_validated_connection_config(self) -> Result<ValidatedConnectionConfig> {
+        self.validate()
     }
 }
 
-impl ValidatedConnectionConfig {
-    pub async fn connect(self) -> Result<Connection<NoopConnectionObserver, NoRawPackets>> {
-        self.connect_with_observer(NoopConnectionObserver).await
+impl IntoValidatedConnectionConfig for ConnectionRequest {
+    fn into_validated_connection_config(self) -> Result<ValidatedConnectionConfig> {
+        self.validate()
     }
+}
 
-    pub async fn connect_with_observer<O>(self, observer: O) -> Result<Connection<O, NoRawPackets>>
-    where
-        O: ConnectionObserver,
-    {
-        self.connect_with_observer_and_raw(observer).await
+impl IntoValidatedConnectionConfig for ValidatedConnectionConfig {
+    fn into_validated_connection_config(self) -> Result<ValidatedConnectionConfig> {
+        Ok(self)
     }
+}
 
-    pub async fn connect_with_observer_and_raw<O, Raw>(
-        self,
-        observer: O,
-    ) -> Result<Connection<O, Raw>>
-    where
-        O: ConnectionObserver,
-        Raw: FrameRaw,
-    {
-        connect_validated_with_observer_and_raw(self, observer).await
-    }
+async fn connect_config_with_observer_and_raw<C, O, Raw>(
+    config: C,
+    observer: O,
+) -> Result<Connection<O, Raw>>
+where
+    C: IntoValidatedConnectionConfig,
+    O: ConnectionObserver,
+    Raw: FrameRaw,
+{
+    connect_validated_with_observer_and_raw(config.into_validated_connection_config()?, observer)
+        .await
 }
 
 async fn connect_validated_with_observer_and_raw<O, Raw>(
@@ -581,7 +678,6 @@ where
     Raw: FrameRaw,
 {
     let websocket_url = config.websocket_url.clone();
-    let runtime_config = config.runtime_config();
     let tuning = config.options.tuning;
     let endpoint = config.endpoint.clone();
     let guild_id = config.identity.guild_id;
@@ -596,7 +692,7 @@ where
         },
         ConnectStage::WebSocketConnect,
         CONNECT_TIMEOUT,
-        connect_websocket(&websocket_url),
+        VoiceEndpoint::new(&websocket_url).connect_websocket(),
     )
     .await?;
     let (mut write, mut read) = ws_stream.split();
@@ -634,7 +730,7 @@ where
     .await?;
     let ready: GatewayReady = parse_data(ready_event.data)?;
 
-    let udp_socket = bind_udp_socket(&ready.ip).await?;
+    let udp_socket = VoiceUdpRemote::parse(&ready.ip)?.bind_socket().await?;
     udp_socket.connect((&*ready.ip, ready.port)).await?;
     udp_socket
         .send(&UdpDiscoveryPacket::request(ready.ssrc))
@@ -654,14 +750,15 @@ where
     )
     .await?;
     let discovery = UdpDiscoveryPacket::decode(&discovery_buffer[..received])?;
-    let selected_mode = select_encryption_mode(&config.options, &ready)?;
+    let selected_mode = ready.select_encryption_mode(&config.options)?;
 
     write
         .send(WsMessage::Text(
             GatewayCommand::SelectProtocol(SelectProtocolCommand::udp(
                 discovery.address.clone(),
                 discovery.port,
-                selected_mode.clone(),
+                selected_mode,
+                &config.options.codec_preferences,
             ))
             .text_payload()?
             .into(),
@@ -681,7 +778,13 @@ where
     )
     .await?;
     let session_description: SessionDescription = parse_data(session_description_event.data)?;
+    let rtp_codecs =
+        DiscordRtpCodecMap::new(&session_description, &config.options.codec_preferences)?;
     let dave_protocol_version = session_description.dave_protocol_version;
+    let dave_identity = config.options.dave_identity.clone();
+    let runtime_config = config.runtime_config();
+    let mut dave = DaveInternalState::default();
+    dave.set_session_protocol(dave_protocol_version);
 
     let initial_state = ConnectionInternalState {
         config: runtime_config,
@@ -691,14 +794,11 @@ where
         discovery,
         selected_mode,
         session_description: Some(session_description),
+        rtp_codecs: Some(rtp_codecs),
         connected_user_ids: Arc::new(HashSet::from([user_id])),
         ssrc_users: Arc::new(HashMap::new()),
         speaking: Arc::new(HashMap::new()),
-        dave: DaveInternalState {
-            protocol_version: dave_protocol_version,
-            passthrough: dave_protocol_version.unwrap_or(0) == 0,
-            ..DaveInternalState::default()
-        },
+        dave,
         roster_authoritative: false,
         resumed: false,
     };
@@ -713,10 +813,9 @@ where
         TransportCrypto::from_config(&session_description.transport_crypto)?
     };
     let (command_tx, command_rx) = mpsc::channel::<ConnectionCommand<Raw>>(128);
-    let (media_tx, media_rx) = mpsc::channel::<PlayoutCommand>(tuning.media_queue_capacity);
+    let (media_tx, media_rx) = mpsc::channel::<PlayoutCommand>(tuning.media_queue_capacity.get());
     let close = ConnectionClose::new();
     let state_rx = state.subscribe_public();
-    let local_ssrc = state.internal().ready.ssrc;
     let task = tokio::spawn(
         ConnectionDriver {
             write,
@@ -724,11 +823,16 @@ where
             command_rx,
             media_rx,
             close: close.clone(),
-            dave: DaveCoordinator::new(user_id, channel_id)?,
+            dave: if let Some(dave_identity) = dave_identity {
+                DaveCoordinator::new_with_identity(user_id, channel_id, dave_identity)?
+            } else {
+                DaveCoordinator::new(user_id, channel_id)?
+            },
             receive: ReceivePipeline::new(tuning),
-            send: SendPipeline::new(local_ssrc),
+            send: SendPipeline::new(state.internal())?,
             transport_crypto,
             pending_media_ready_waits: DeadlineQueue::default(),
+            pending_media_ready_sends: DeadlineQueue::default(),
             state,
             observer: observer.clone(),
             udp_socket,

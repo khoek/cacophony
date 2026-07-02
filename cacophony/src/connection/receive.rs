@@ -1,27 +1,19 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, num::NonZeroUsize};
 
-use dave::MediaType;
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
     buffer::ReusableBuffer,
-    dave::{
-        dave_decrypt_failure_should_retry, dave_gateway_media_ready, dave_receive_transform_active,
-        dave_transition_zero_media_ready,
-    },
     errors::{DaveError, Error, PayloadKind, ProtocolError, Result},
-    media::{
-        FrameRaw, RawUdpPacket, RawUdpPacketInfo, ReceivedFrame, detect_rtp_codec, parse_rtp_header,
-    },
+    media::{FrameRaw, RawUdpPacket, RawUdpPacketInfo, ReceivedFrame, RtpHeader},
     observer::{
         ConnectionObserver, DavePendingMediaReason, ReceiveDecodeContext, ReceiveDecodeErrorKind,
         ReceiveDecodeStage, ReceiveFrameDropReason, ReceiveFrameDroppedEvent, RtcpPacketEvent,
         observe_receive_decode_error,
     },
-    opus::PayloadCodec,
     queue::{BoundedDeque, BucketQueue, DriverReply, QueueBucket},
     state::{
-        ConnectionTuning, DavePendingMediaRetry, PendingMediaFrame, PendingMediaPacket,
+        ConnectionRuntimeTuning, DavePendingMediaRetry, PendingMediaFrame, PendingMediaPacket,
         ReceiveState,
     },
 };
@@ -96,7 +88,7 @@ where
     Raw: FrameRaw,
 {
     fn default() -> Self {
-        Self::new(ConnectionTuning::default().ready_frame_buffer_max)
+        Self::new(ConnectionRuntimeTuning::default().ready_frame_buffer_max)
     }
 }
 
@@ -104,7 +96,7 @@ impl<Raw> ReadyFrameQueue<Raw>
 where
     Raw: FrameRaw,
 {
-    pub(crate) fn new(max_frames: usize) -> Self {
+    pub(crate) fn new(max_frames: NonZeroUsize) -> Self {
         Self {
             frames: BoundedDeque::new(max_frames),
         }
@@ -198,7 +190,7 @@ impl<Raw> ReceivePipeline<Raw>
 where
     Raw: FrameRaw,
 {
-    pub(super) fn new(tuning: ConnectionTuning) -> Self {
+    pub(super) fn new(tuning: ConnectionRuntimeTuning) -> Self {
         Self {
             state: ReceiveState::new(tuning),
             udp_buffer: ReusableBuffer::new(),
@@ -264,50 +256,6 @@ where
     }
 }
 
-pub(super) fn take_receive_payload_buffer(buffer: &mut ReusableBuffer) -> Vec<u8> {
-    buffer.take()
-}
-
-pub(super) fn recycle_receive_payload_buffer(buffer: &mut ReusableBuffer, payload: Vec<u8>) {
-    buffer.recycle_largest(payload);
-}
-
-pub(crate) fn limit_raw_packet_result(
-    raw: RawUdpPacket,
-    max_len: usize,
-    kind: PayloadKind,
-) -> Result<RawUdpPacket> {
-    if raw.bytes.len() > max_len {
-        Err(Error::PayloadTooLarge {
-            kind,
-            len: raw.bytes.len(),
-            max_len,
-        })
-    } else {
-        Ok(raw)
-    }
-}
-
-pub(crate) fn limit_voice_frame_result<Raw>(
-    result: FrameReceiveResult<Raw>,
-    max_len: usize,
-) -> FrameReceiveResult<Raw>
-where
-    Raw: FrameRaw,
-{
-    result.and_then(|frame| {
-        if frame.frame.len() > max_len {
-            Err(Error::PayloadTooLarge {
-                kind: PayloadKind::Frame,
-                len: frame.frame.len(),
-                max_len,
-            })
-        } else {
-            Ok(frame)
-        }
-    })
-}
-
 impl<O, Raw> ConnectionDriver<O, Raw>
 where
     O: crate::observer::ConnectionObserver,
@@ -355,11 +303,6 @@ where
         }
     }
 
-    pub(super) fn discard_inactive_pending_receives(&mut self) {
-        self.receive.discard_closed_frame_stream();
-        self.receive.discard_closed_packet_receives();
-    }
-
     pub(super) fn handle_received_udp_packet(&mut self, len: usize) {
         let bytes = &self.receive.udp_buffer.as_slice()[..len];
         let info = RawUdpPacketInfo::from_bytes(bytes);
@@ -394,11 +337,10 @@ where
         };
         let max_len = receive.max_len;
         let bytes = &self.receive.udp_buffer.as_slice()[..len];
-        receive.complete(limit_raw_packet_result(
-            info.into_raw_packet(bytes),
-            max_len,
-            kind.payload_kind(),
-        ));
+        receive.complete(
+            info.into_raw_packet(bytes)
+                .ensure_len_at_most(max_len, kind.payload_kind()),
+        );
     }
 
     fn decode_received_voice_packet(
@@ -407,7 +349,7 @@ where
         len: usize,
     ) -> Option<FrameReceiveResult<Raw>> {
         let packet_bytes = &self.receive.udp_buffer.as_slice()[..len];
-        let rtp = match parse_rtp_header(packet_bytes) {
+        let rtp = match RtpHeader::parse(packet_bytes) {
             Ok(rtp) => rtp,
             Err(error) => {
                 self.observe_decode_error(
@@ -423,8 +365,8 @@ where
         };
         let (user_id, codec, dave_active) = {
             let state = self.state.internal();
-            let session_description = match state.session_description.as_ref() {
-                Some(session_description) => session_description,
+            let rtp_codecs = match state.rtp_codecs.as_ref() {
+                Some(rtp_codecs) => rtp_codecs,
                 None => {
                     return Some(Err(Error::Protocol(
                         ProtocolError::MissingSessionDescription,
@@ -432,7 +374,7 @@ where
                 }
             };
             let user_id = state.ssrc_users.get(&rtp.ssrc).copied();
-            let codec = match detect_rtp_codec(&rtp, session_description) {
+            let codec = match rtp_codecs.detect(rtp.payload_type) {
                 Ok(codec) => codec,
                 Err(error) => {
                     self.observe_decode_error(
@@ -446,7 +388,7 @@ where
                     return Some(Err(error.into()));
                 }
             };
-            (user_id, codec, dave_receive_transform_active(&state.dave))
+            (user_id, codec, state.dave.receive_transform_active())
         };
         self.receive.payload_buffer.clear();
         if let Err(error) = self.transport_crypto.decrypt_payload_into(
@@ -469,18 +411,23 @@ where
             rtp,
             user_id,
             codec,
-            encrypted_payload: take_receive_payload_buffer(&mut self.receive.payload_buffer),
+            encrypted_payload: self.receive.payload_buffer.take(),
             dave: dave_active,
         };
-        let media = self
-            .receive
-            .state
-            .push_media_packet(&self.observer, packet)?;
+        let media = match self.receive.state.push_media_packet(&self.observer, packet) {
+            Ok(Some(media)) => media,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
         self.decode_ordered_media_frame(media)
     }
 
     fn drain_ready_voice_frame(&mut self) -> Option<FrameReceiveResult<Raw>> {
         while let Some(media) = self.receive.state.drain_ordered_media(&self.observer) {
+            let media = match media {
+                Ok(media) => media,
+                Err(error) => return Some(Err(error)),
+            };
             if let Some(result) = self.decode_ordered_media_frame(media) {
                 return Some(result);
             }
@@ -499,7 +446,7 @@ where
             raw: media.raw,
             rtp: media.rtp,
             user_id: media.user_id,
-            media_type: MediaType::Audio,
+            media_type: media.codec.media_type(),
             codec: media.codec,
             frame: media.encrypted_frame,
         }))
@@ -509,7 +456,13 @@ where
         if retry.is_empty() {
             return;
         }
-        let ttl = self.state.internal().config.tuning.dave_pending_media_ttl;
+        let ttl = self
+            .state
+            .internal()
+            .config
+            .options
+            .tuning
+            .dave_pending_media_ttl;
         while let Some(mut media) = self.receive.state.pending_dave_media.pop_retry(retry) {
             media.was_pending = true;
             if media.enqueued_at.elapsed() >= ttl {
@@ -550,8 +503,10 @@ where
         let (gateway_pending, transition_zero_ready) = {
             let state = self.state.internal();
             (
-                !dave_gateway_media_ready(&state.dave),
-                dave_transition_zero_media_ready(&state.dave, self.dave.transition_ready()),
+                !state.dave.gateway_media_ready(),
+                state
+                    .dave
+                    .transition_zero_media_ready(self.dave.transition_ready()),
             )
         };
         if !self.dave.ready() {
@@ -563,8 +518,9 @@ where
             return None;
         }
         self.receive.payload_buffer.clear();
-        match self.dave.decrypt_media_frame_into::<PayloadCodec>(
+        match self.dave.decrypt_media_frame_into(
             media.user_id,
+            media.codec.media_type(),
             &media.encrypted_frame,
             self.receive.payload_buffer.as_vec_mut(),
         ) {
@@ -573,16 +529,15 @@ where
                     self.observe_pending_dave_media(&media, media.reason, true);
                 }
                 self.receive.payload_buffer.truncate(len);
-                let frame = take_receive_payload_buffer(&mut self.receive.payload_buffer);
-                recycle_receive_payload_buffer(
-                    &mut self.receive.payload_buffer,
-                    std::mem::take(&mut media.encrypted_frame),
-                );
+                let frame = self.receive.payload_buffer.take();
+                self.receive
+                    .payload_buffer
+                    .recycle_largest(std::mem::take(&mut media.encrypted_frame));
                 Some(Ok(ReceivedFrame {
                     raw: media.raw,
                     rtp: media.rtp,
                     user_id: media.user_id,
-                    media_type: MediaType::Audio,
+                    media_type: media.codec.media_type(),
                     codec: media.codec,
                     frame,
                 }))
@@ -598,11 +553,14 @@ where
                     &error,
                 );
                 if media.enqueued_at.elapsed()
-                    < self.state.internal().config.tuning.dave_pending_media_ttl
-                    && dave_decrypt_failure_should_retry(
-                        kind,
-                        self.dave_decrypt_state_can_still_change(),
-                    )
+                    < self
+                        .state
+                        .internal()
+                        .config
+                        .options
+                        .tuning
+                        .dave_pending_media_ttl
+                    && kind.should_retry_dave_decrypt(self.dave_decrypt_state_can_still_change())
                 {
                     let reason = if error.is_no_valid_cryptor() {
                         DavePendingMediaReason::NoValidCryptorPending
@@ -618,10 +576,9 @@ where
                     false,
                 );
                 let error = DaveError::Decrypt(error).into();
-                recycle_receive_payload_buffer(
-                    &mut self.receive.payload_buffer,
-                    std::mem::take(&mut media.encrypted_frame),
-                );
+                self.receive
+                    .payload_buffer
+                    .recycle_largest(std::mem::take(&mut media.encrypted_frame));
                 Some(Err(error))
             }
         }

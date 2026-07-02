@@ -6,14 +6,16 @@ use std::{
 };
 
 use dave::{
-    CreateKeyPackageError, DecryptError, EncryptError, FrameDecryptError, InitError,
+    Codec, CreateKeyPackageError, DecryptError, EncryptError, FrameDecryptError, InitError,
     ProcessCommitError, ProcessProposalsError, ProcessWelcomeError, SetExternalSenderError,
+    UpdateRatchetsError,
 };
+use thiserror::Error as ThisError;
 
 use crate::{
-    media::MediaCodec,
     observer::{ConnectStage, ReceiveDecodeErrorKind},
-    state::EncryptionMode,
+    rtp::RtpPayloadType,
+    state::{EncryptionMode, OfferedEncryptionMode},
 };
 
 #[derive(Debug)]
@@ -41,6 +43,19 @@ pub enum Error {
     Backpressure(BackpressureError),
     Closed,
     Join(ConnectionJoinError),
+}
+
+impl Error {
+    pub fn receive_decode_kind(&self) -> Option<ReceiveDecodeErrorKind> {
+        match self {
+            Self::Rtp(_) => Some(ReceiveDecodeErrorKind::MalformedRtp),
+            Self::UnsupportedCodec(_) => Some(ReceiveDecodeErrorKind::UnsupportedCodec),
+            Self::TransportCrypto(_) => Some(ReceiveDecodeErrorKind::TransportDecryptFailed),
+            Self::Dave(DaveError::Decrypt(error)) => Some(error.receive_decode_kind()),
+            Self::Opus(_) => Some(ReceiveDecodeErrorKind::OpusDecodeFailed),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -145,317 +160,158 @@ impl From<TransportCryptoError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum PcmError {
+    #[error("PCM sample rate must be greater than zero")]
     SampleRateZero,
+    #[error("PCM channel count must be greater than zero")]
     ChannelCountZero,
+    #[error("{encoding} PCM byte length {byte_len} is not aligned to {sample_bytes}-byte samples")]
     SampleAlignment {
         encoding: &'static str,
         byte_len: usize,
         sample_bytes: usize,
     },
-    ChannelAlignment {
-        channels: usize,
-        samples: usize,
-    },
+    #[error("PCM sample count {samples} is not aligned to {channels} channels")]
+    ChannelAlignment { channels: usize, samples: usize },
+    #[error("PCM encoding `{0}` is not supported")]
     UnsupportedEncoding(String),
+    #[error("PCM resampler chunk frame count must be greater than zero")]
     ResamplerChunkFramesZero,
+    #[error("PCM resampler is not initialized")]
     ResamplerNotInitialized,
+    #[error("PCM resampler error: {0}")]
     Resampler(String),
 }
 
-impl fmt::Display for PcmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SampleRateZero => f.write_str("PCM sample rate must be greater than zero"),
-            Self::ChannelCountZero => f.write_str("PCM channel count must be greater than zero"),
-            Self::SampleAlignment {
-                encoding,
-                byte_len,
-                sample_bytes,
-            } => write!(
-                f,
-                "{encoding} PCM byte length {byte_len} is not aligned to {sample_bytes}-byte samples",
-            ),
-            Self::ChannelAlignment { channels, samples } => write!(
-                f,
-                "PCM sample count {samples} is not aligned to {channels} channels",
-            ),
-            Self::UnsupportedEncoding(encoding) => {
-                write!(f, "PCM encoding `{encoding}` is not supported")
-            }
-            Self::ResamplerChunkFramesZero => {
-                f.write_str("PCM resampler chunk frame count must be greater than zero")
-            }
-            Self::ResamplerNotInitialized => f.write_str("PCM resampler is not initialized"),
-            Self::Resampler(reason) => write!(f, "PCM resampler error: {reason}"),
-        }
-    }
-}
-
-impl std::error::Error for PcmError {}
-
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum InvalidInputError {
-    ConnectionTuningZero {
-        field: &'static str,
-    },
+    #[error("connection tuning field {field} must be greater than zero")]
+    ConnectionTuningZero { field: &'static str },
+    #[error("connection tuning field {field} must be at least {min}, got {actual}")]
     ConnectionTuningTooSmall {
         field: &'static str,
         min: usize,
         actual: usize,
     },
-    ConnectionTuningDurationZero {
-        field: &'static str,
-    },
-    UnsupportedGatewayVersion {
-        version: u8,
-    },
+    #[error("connection tuning duration {field} must be nonzero")]
+    ConnectionTuningDurationZero { field: &'static str },
+    #[error("Discord voice gateway version {version} is unsupported")]
+    UnsupportedGatewayVersion { version: u8 },
+    #[error("{} cannot be configured as a Discord video codec", codec.as_str())]
+    VideoCodecPreferenceNotVideo { codec: Codec },
+    #[error("{} appears more than once in Discord video codec preferences", codec.as_str())]
+    DuplicateVideoCodecPreference { codec: Codec },
+    #[error("max_len must be greater than zero")]
     ZeroMaxLen,
-    EmptyPayload {
-        codec: MediaCodec,
-    },
-    PcmBlockSampleCount {
-        expected: usize,
-        actual: usize,
-    },
-    PcmBlockFrameCount {
-        expected: usize,
-        actual: usize,
-    },
+    #[error("{} frame must not be empty", codec.as_str())]
+    EmptyPayload { codec: Codec },
+    #[error("Discord PCM block must contain {expected} interleaved f32 samples, got {actual}")]
+    PcmBlockSampleCount { expected: usize, actual: usize },
+    #[error("Discord PCM block must contain {expected} samples per channel, got {actual}")]
+    PcmBlockFrameCount { expected: usize, actual: usize },
+    #[error("captured PCM audio must not be empty")]
     PcmArchiveEmpty,
+    #[error("Ogg Opus vendor must not be empty")]
     OggOpusVendorEmpty,
-    OggOpusUnsupportedSampleRate {
-        sample_rate_hz: u32,
-    },
-    DiscordPcmMixedSampleRates {
-        existing: u32,
-        actual: u32,
-    },
-    DiscordPcmMixedChannelCounts {
-        existing: usize,
-        actual: usize,
-    },
+    #[error("Ogg Opus archive encoding does not support {sample_rate_hz} Hz captured audio")]
+    OggOpusUnsupportedSampleRate { sample_rate_hz: u32 },
+    #[error("Discord PCM playback received mixed sample rates: {existing} and {actual}")]
+    DiscordPcmMixedSampleRates { existing: u32, actual: u32 },
+    #[error("Discord PCM playback received mixed channel counts: {existing} and {actual}")]
+    DiscordPcmMixedChannelCounts { existing: usize, actual: usize },
+    #[error("Discord PCM playback received mixed PCM encodings")]
     DiscordPcmMixedEncoding,
+    #[error("Discord PCM encoder was not initialized")]
     DiscordPcmEncoderUninitialized,
-    OpusBitrateTooLarge {
-        bitrate_bps: u32,
-    },
-    OpusOutputBufferTooSmall {
-        min_len: usize,
-        len: usize,
-    },
+    #[error("Opus bitrate {bitrate_bps} bps exceeds the encoder limit")]
+    OpusBitrateTooLarge { bitrate_bps: u32 },
+    #[error("Opus output buffer must be at least {min_len} bytes, got {len}")]
+    OpusOutputBufferTooSmall { min_len: usize, len: usize },
 }
 
-impl fmt::Display for InvalidInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ConnectionTuningZero { field } => {
-                write!(
-                    f,
-                    "connection tuning field {field} must be greater than zero"
-                )
-            }
-            Self::ConnectionTuningTooSmall { field, min, actual } => write!(
-                f,
-                "connection tuning field {field} must be at least {min}, got {actual}",
-            ),
-            Self::ConnectionTuningDurationZero { field } => {
-                write!(f, "connection tuning duration {field} must be nonzero")
-            }
-            Self::UnsupportedGatewayVersion { version } => {
-                write!(f, "Discord voice gateway version {version} is unsupported")
-            }
-            Self::ZeroMaxLen => f.write_str("max_len must be greater than zero"),
-            Self::EmptyPayload { codec } => write!(f, "{codec} frame must not be empty"),
-            Self::PcmBlockSampleCount { expected, actual } => write!(
-                f,
-                "Discord PCM block must contain {expected} interleaved f32 samples, got {actual}",
-            ),
-            Self::PcmBlockFrameCount { expected, actual } => write!(
-                f,
-                "Discord PCM block must contain {expected} samples per channel, got {actual}",
-            ),
-            Self::PcmArchiveEmpty => f.write_str("captured PCM audio must not be empty"),
-            Self::OggOpusVendorEmpty => f.write_str("Ogg Opus vendor must not be empty"),
-            Self::OggOpusUnsupportedSampleRate { sample_rate_hz } => write!(
-                f,
-                "Ogg Opus archive encoding does not support {sample_rate_hz} Hz captured audio"
-            ),
-            Self::DiscordPcmMixedSampleRates { existing, actual } => write!(
-                f,
-                "Discord PCM playback received mixed sample rates: {existing} and {actual}"
-            ),
-            Self::DiscordPcmMixedChannelCounts { existing, actual } => write!(
-                f,
-                "Discord PCM playback received mixed channel counts: {existing} and {actual}"
-            ),
-            Self::DiscordPcmMixedEncoding => {
-                f.write_str("Discord PCM playback received mixed PCM encodings")
-            }
-            Self::DiscordPcmEncoderUninitialized => {
-                f.write_str("Discord PCM encoder was not initialized")
-            }
-            Self::OpusBitrateTooLarge { bitrate_bps } => write!(
-                f,
-                "Opus bitrate {bitrate_bps} bps exceeds the encoder limit",
-            ),
-            Self::OpusOutputBufferTooSmall { min_len, len } => write!(
-                f,
-                "Opus output buffer must be at least {min_len} bytes, got {len}",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for InvalidInputError {}
-
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum ProtocolError {
+    #[error("DAVE MLS key package and commit/welcome use binary websocket frames")]
     TextPayloadRequiresBinaryDaveMlsCommand,
-    UdpDiscoveryPacketTooShort {
-        len: usize,
-        min_len: usize,
-    },
+    #[error("voice discovery packet must be at least {min_len} bytes, got {len}")]
+    UdpDiscoveryPacketTooShort { len: usize, min_len: usize },
+    #[error(
+        "unexpected voice discovery packet type {packet_type}; expected {expected_packet_type}"
+    )]
     UnexpectedUdpDiscoveryPacketType {
         packet_type: u16,
         expected_packet_type: u16,
     },
+    #[error(
+        "unexpected voice discovery packet length {packet_len}; expected {expected_packet_len}"
+    )]
     UnexpectedUdpDiscoveryPacketLen {
         packet_len: u16,
         expected_packet_len: u16,
     },
-    InvalidUdpDiscoveryIp(Utf8Error),
+    #[error("invalid voice discovery ip: {0}")]
+    InvalidUdpDiscoveryIp(#[source] Utf8Error),
+    #[error("voice ready payload did not include encryption modes")]
     ReadyMissingEncryptionModes,
-    ReadyMissingSupportedEncryptionMode {
-        modes: Vec<EncryptionMode>,
+    #[error("required voice encryption mode {required_mode} was not offered: {modes:?}")]
+    RequiredEncryptionModeUnavailable {
+        required_mode: EncryptionMode,
+        modes: Vec<OfferedEncryptionMode>,
     },
+    #[error("voice ready payload did not include a supported encryption mode: {modes:?}")]
+    ReadyMissingSupportedEncryptionMode { modes: Vec<OfferedEncryptionMode> },
+    #[error("resolve voice websocket endpoint {host}:{port}: {source}")]
     ResolveWebSocketEndpoint {
         host: String,
         port: u16,
+        #[source]
         source: std::io::Error,
     },
-    WebSocketEndpointNoAddresses {
-        host: String,
-        port: u16,
-    },
+    #[error("voice websocket endpoint {host}:{port} did not resolve to any addresses")]
+    WebSocketEndpointNoAddresses { host: String, port: u16 },
+    #[error("voice websocket connect to {address} timed out after {duration:?}")]
     WebSocketAddressConnectTimeout {
         address: SocketAddr,
         duration: Duration,
     },
+    #[error(
+        "voice websocket connect to {host}:{port} failed across {address_count} resolved addresses: {}",
+        errors.join("; ")
+    )]
     WebSocketAllAddressesFailed {
         host: String,
         port: u16,
         address_count: usize,
         errors: Vec<String>,
     },
+    #[error("tcp connect {address}: {source}")]
     TcpConnect {
         address: SocketAddr,
+        #[source]
         source: std::io::Error,
     },
+    #[error("voice websocket URL did not include a host")]
     WebSocketUrlMissingHost,
+    #[error("voice websocket URL did not include a usable scheme")]
     WebSocketUrlMissingUsableScheme,
+    #[error("invalid Discord voice UDP IP {remote_ip:?}: {source}")]
     InvalidDiscordVoiceUdpIp {
         remote_ip: String,
+        #[source]
         source: AddrParseError,
     },
+    #[error("voice heartbeat ACK timed out")]
     HeartbeatAckTimeout,
+    #[error("missing voice session description")]
     MissingSessionDescription,
-}
-
-impl ProtocolError {
-    fn source_error(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidUdpDiscoveryIp(error) => Some(error),
-            Self::ResolveWebSocketEndpoint { source, .. } => Some(source),
-            Self::TcpConnect { source, .. } => Some(source),
-            Self::InvalidDiscordVoiceUdpIp { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TextPayloadRequiresBinaryDaveMlsCommand => {
-                f.write_str("DAVE MLS key package and commit/welcome use binary websocket frames")
-            }
-            Self::UdpDiscoveryPacketTooShort { len, min_len } => write!(
-                f,
-                "voice discovery packet must be at least {min_len} bytes, got {len}",
-            ),
-            Self::UnexpectedUdpDiscoveryPacketType {
-                packet_type,
-                expected_packet_type,
-            } => write!(
-                f,
-                "unexpected voice discovery packet type {packet_type}; expected {expected_packet_type}",
-            ),
-            Self::UnexpectedUdpDiscoveryPacketLen {
-                packet_len,
-                expected_packet_len,
-            } => write!(
-                f,
-                "unexpected voice discovery packet length {packet_len}; expected {expected_packet_len}",
-            ),
-            Self::InvalidUdpDiscoveryIp(error) => {
-                write!(f, "invalid voice discovery ip: {error}")
-            }
-            Self::ReadyMissingEncryptionModes => {
-                f.write_str("voice ready payload did not include encryption modes")
-            }
-            Self::ReadyMissingSupportedEncryptionMode { modes } => write!(
-                f,
-                "voice ready payload did not include a supported encryption mode: {modes:?}",
-            ),
-            Self::ResolveWebSocketEndpoint { host, port, source } => {
-                write!(
-                    f,
-                    "resolve voice websocket endpoint {host}:{port}: {source}"
-                )
-            }
-            Self::WebSocketEndpointNoAddresses { host, port } => write!(
-                f,
-                "voice websocket endpoint {host}:{port} did not resolve to any addresses",
-            ),
-            Self::WebSocketAddressConnectTimeout { address, duration } => {
-                write!(
-                    f,
-                    "voice websocket connect to {address} timed out after {duration:?}"
-                )
-            }
-            Self::WebSocketAllAddressesFailed {
-                host,
-                port,
-                address_count,
-                errors,
-            } => write!(
-                f,
-                "voice websocket connect to {host}:{port} failed across {address_count} \
-                 resolved addresses: {}",
-                errors.join("; "),
-            ),
-            Self::TcpConnect { address, source } => write!(f, "tcp connect {address}: {source}"),
-            Self::WebSocketUrlMissingHost => {
-                f.write_str("voice websocket URL did not include a host")
-            }
-            Self::WebSocketUrlMissingUsableScheme => {
-                f.write_str("voice websocket URL did not include a usable scheme")
-            }
-            Self::InvalidDiscordVoiceUdpIp { remote_ip, source } => {
-                write!(f, "invalid Discord voice UDP IP {remote_ip:?}: {source}")
-            }
-            Self::HeartbeatAckTimeout => f.write_str("voice heartbeat ACK timed out"),
-            Self::MissingSessionDescription => f.write_str("missing voice session description"),
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source_error()
-    }
+    #[error("Discord voice session did not negotiate {} transmission; negotiated {negotiated_codec:?}", codec.as_str())]
+    MediaCodecNotNegotiated {
+        codec: Codec,
+        negotiated_codec: Option<Codec>,
+    },
+    #[error("Discord voice ready payload did not include a video SSRC for {}", codec.as_str())]
+    MissingVideoSsrc { codec: Codec },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,97 +335,82 @@ impl fmt::Display for OpusOperation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum OpusError {
+    #[error("failed to {operation}: {reason}")]
     OperationFailed {
         operation: OpusOperation,
         reason: &'static str,
     },
-    UnsupportedVoiceCodec {
-        codec: MediaCodec,
+    #[error("unsupported voice codec {}", codec.as_str())]
+    UnsupportedVoiceCodec { codec: Codec },
+    #[error("unsupported Opus channel count {channels}")]
+    UnsupportedChannelCount { channels: usize },
+    #[error("invalid Opus packet: {reason}")]
+    InvalidPacket { reason: &'static str },
+    #[error(
+        "Discord Opus packet must contain {expected_samples_per_channel} samples per channel, got {actual_samples_per_channel}"
+    )]
+    UnsupportedDiscordPacketDuration {
+        expected_samples_per_channel: usize,
+        actual_samples_per_channel: usize,
     },
-    UnsupportedChannelCount {
-        channels: usize,
-    },
+    #[error("Opus resampler is not initialized")]
     ResamplerNotInitialized,
+    #[error("Opus resampler error: {0}")]
     Resampler(String),
+    #[error("Opus frame is empty")]
     EmptyFrame,
+    #[error("Ogg Opus asset is empty")]
+    OggOpusEmpty,
+    #[error("failed to read Ogg Opus packet: {0}")]
+    OggOpusRead(String),
+    #[error("Ogg Opus asset contains no packets")]
+    OggOpusNoPackets,
+    #[error("first Ogg Opus packet is not marked as the start of stream")]
+    OggOpusHeaderNotStart,
+    #[error("Ogg stream is not Opus")]
+    OggOpusMissingHead,
+    #[error("unsupported OpusHead version {version}")]
+    OggOpusUnsupportedVersion { version: u8 },
+    #[error("Ogg Opus channel count must be 1 or 2, got {channels}")]
+    OggOpusUnsupportedChannelCount { channels: u8 },
+    #[error("Ogg Opus mapping family must be 0, got {mapping_family}")]
+    OggOpusUnsupportedMappingFamily { mapping_family: u8 },
+    #[error("Ogg Opus asset is missing OpusTags packet")]
+    OggOpusMissingTags,
+    #[error("Ogg Opus asset contains multiple logical streams")]
+    OggOpusMultipleLogicalStreams,
+    #[error("Ogg Opus asset contains no audio packets")]
+    OggOpusNoAudioPackets,
+    #[error("Ogg Opus asset contains no audio after pre-skip")]
+    OggOpusNoAudioAfterPreSkip,
+    #[error("Ogg Opus asset decoded to empty audio")]
+    OggOpusDecodedEmpty,
+    #[error("Ogg Opus output sample rate {sample_rate_hz} exceeds the decoder limit")]
+    OggOpusOutputSampleRateTooLarge { sample_rate_hz: u32 },
 }
 
-impl fmt::Display for OpusError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OperationFailed { operation, reason } => {
-                write!(f, "failed to {operation}: {reason}")
-            }
-            Self::UnsupportedVoiceCodec { codec } => {
-                write!(f, "unsupported voice codec {codec:?}")
-            }
-            Self::UnsupportedChannelCount { channels } => {
-                write!(f, "unsupported Opus channel count {channels}")
-            }
-            Self::ResamplerNotInitialized => f.write_str("Opus resampler is not initialized"),
-            Self::Resampler(reason) => write!(f, "Opus resampler error: {reason}"),
-            Self::EmptyFrame => f.write_str("Opus frame is empty"),
-        }
-    }
-}
-
-impl std::error::Error for OpusError {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ThisError)]
 pub enum BackpressureError {
+    #[error("voice connection command queue is full")]
     CommandQueueFull,
+    #[error("voice connection media queue is full")]
     MediaQueueFull,
+    #[error("voice connection already has an active Opus playout")]
     ActiveOpusPlayout,
+    #[error("voice connection already has an active media frame stream")]
     ActiveFrameStream,
 }
 
-impl fmt::Display for BackpressureError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CommandQueueFull => f.write_str("voice connection command queue is full"),
-            Self::MediaQueueFull => f.write_str("voice connection media queue is full"),
-            Self::ActiveOpusPlayout => {
-                f.write_str("voice connection already has an active Opus playout")
-            }
-            Self::ActiveFrameStream => {
-                f.write_str("voice connection already has an active media frame stream")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BackpressureError {}
-
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum ConnectionJoinError {
-    ControlTaskJoinFailed(tokio::task::JoinError),
+    #[error("voice control task join failed: {0}")]
+    ControlTaskJoinFailed(#[source] tokio::task::JoinError),
+    #[error("voice join task is closed")]
     JoinTaskClosed,
+    #[error("voice join task stopped before replying")]
     JoinTaskStoppedBeforeReply,
-}
-
-impl fmt::Display for ConnectionJoinError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ControlTaskJoinFailed(error) => {
-                write!(f, "voice control task join failed: {error}")
-            }
-            Self::JoinTaskClosed => f.write_str("voice join task is closed"),
-            Self::JoinTaskStoppedBeforeReply => {
-                f.write_str("voice join task stopped before replying")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConnectionJoinError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::ControlTaskJoinFailed(error) => Some(error),
-            Self::JoinTaskClosed | Self::JoinTaskStoppedBeforeReply => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,41 +420,29 @@ pub enum PayloadKind {
     Frame,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum UnsupportedCodecError {
-    UnsupportedAudioCodec {
-        codec: String,
-    },
+    #[error("unsupported Discord voice audio codec {codec:?}; only Opus is supported")]
+    UnsupportedAudioCodec { codec: String },
+    #[error("unsupported Discord voice video codec {codec:?}")]
+    UnsupportedVideoCodec { codec: String },
+    #[error(
+        "unsupported Discord voice RTP payload type {payload_type}; expected one of {expected_payload_types:?}"
+    )]
     UnsupportedRtpPayloadType {
-        payload_type: u8,
-        expected_payload_type: u8,
-        codec: MediaCodec,
+        payload_type: RtpPayloadType,
+        expected_payload_types: Vec<RtpPayloadType>,
+    },
+    #[error(
+        "Discord voice RTP payload type {payload_type} is {}; negotiated payload types are {expected_payload_types:?}",
+        codec.as_str()
+    )]
+    UnexpectedRtpPayloadCodec {
+        payload_type: RtpPayloadType,
+        codec: Codec,
+        expected_payload_types: Vec<RtpPayloadType>,
     },
 }
-
-impl fmt::Display for UnsupportedCodecError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedAudioCodec { codec } => {
-                write!(
-                    f,
-                    "unsupported Discord voice audio codec {codec:?}; only Opus is supported"
-                )
-            }
-            Self::UnsupportedRtpPayloadType {
-                payload_type,
-                expected_payload_type,
-                codec,
-            } => write!(
-                f,
-                "unsupported Discord voice RTP payload type {payload_type} for {codec}; \
-                 expected {expected_payload_type}",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for UnsupportedCodecError {}
 
 impl fmt::Display for PayloadKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -625,138 +454,77 @@ impl fmt::Display for PayloadKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum RtpError {
-    PacketTooShort {
-        len: usize,
-    },
-    UnsupportedVersion {
-        version: u8,
-    },
+    #[error("voice RTP packet is shorter than 12 bytes: {len}")]
+    PacketTooShort { len: usize },
+    #[error("unsupported voice RTP version {version}; expected 2")]
+    UnsupportedVersion { version: u8 },
+    #[error(
+        "voice RTP packet has truncated CSRC list: {len} bytes for {expected_header_len} byte header"
+    )]
     TruncatedCsrcList {
         len: usize,
         expected_header_len: usize,
     },
+    #[error(
+        "voice RTP packet has truncated extension header: {len} bytes for {expected_header_len} byte header"
+    )]
     TruncatedExtensionHeader {
         len: usize,
         expected_header_len: usize,
     },
+    #[error(
+        "voice RTP packet has truncated extension payload: {len} bytes for {expected_header_len} byte header"
+    )]
     TruncatedExtensionPayload {
         len: usize,
         expected_header_len: usize,
     },
+    #[error("voice RTP packet has truncated encrypted extension")]
     TruncatedEncryptedExtension,
+    #[error("voice RTP packet has empty padded payload")]
     EmptyPaddedPayload,
-    InvalidPadding {
-        padding: usize,
+    #[error(
+        "voice RTP packet has invalid padding length {padding} for payload length {payload_len}"
+    )]
+    InvalidPadding { padding: usize, payload_len: usize },
+    #[error(
+        "{} RTP payload is {payload_len} bytes, exceeding the per-packet media payload limit {max_payload_len}",
+        codec.as_str()
+    )]
+    PayloadTooLarge {
+        codec: Codec,
         payload_len: usize,
+        max_payload_len: usize,
     },
+    #[error("malformed {} RTP payload: {reason}", codec.as_str())]
+    MalformedPayload { codec: Codec, reason: &'static str },
 }
 
-impl fmt::Display for RtpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PacketTooShort { len } => {
-                write!(f, "voice RTP packet is shorter than 12 bytes: {len}")
-            }
-            Self::UnsupportedVersion { version } => {
-                write!(f, "unsupported voice RTP version {version}; expected 2")
-            }
-            Self::TruncatedCsrcList {
-                len,
-                expected_header_len,
-            } => write!(
-                f,
-                "voice RTP packet has truncated CSRC list: {len} bytes for {expected_header_len} byte header",
-            ),
-            Self::TruncatedExtensionHeader {
-                len,
-                expected_header_len,
-            } => write!(
-                f,
-                "voice RTP packet has truncated extension header: {len} bytes for {expected_header_len} byte header",
-            ),
-            Self::TruncatedExtensionPayload {
-                len,
-                expected_header_len,
-            } => write!(
-                f,
-                "voice RTP packet has truncated extension payload: {len} bytes for {expected_header_len} byte header",
-            ),
-            Self::TruncatedEncryptedExtension => {
-                f.write_str("voice RTP packet has truncated encrypted extension")
-            }
-            Self::EmptyPaddedPayload => f.write_str("voice RTP packet has empty padded payload"),
-            Self::InvalidPadding {
-                padding,
-                payload_len,
-            } => write!(
-                f,
-                "voice RTP packet has invalid padding length {padding} for payload length {payload_len}",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RtpError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum TransportCryptoError {
-    InvalidSecretKeyLen {
-        len: usize,
-    },
-    MissingRtpSizeNonce {
-        packet_len: usize,
-        min_len: usize,
-    },
+    #[error("voice secret_key must be 32 bytes, got {len}")]
+    InvalidSecretKeyLen { len: usize },
+    #[error(
+        "voice RTP packet is missing the RTP-size nonce suffix: {packet_len} bytes for minimum {min_len}"
+    )]
+    MissingRtpSizeNonce { packet_len: usize, min_len: usize },
+    #[error("failed to initialize voice nonce from OS randomness")]
+    NonceRandomnessUnavailable,
+    #[error("invalid AES-GCM voice secret key")]
     InvalidAesGcmKey,
+    #[error("invalid XChaCha20-Poly1305 voice secret key")]
     InvalidXChaCha20Poly1305Key,
+    #[error("failed to decrypt AES-GCM voice packet")]
     AesGcmDecryptFailed,
+    #[error("failed to encrypt AES-GCM voice packet")]
     AesGcmEncryptFailed,
+    #[error("failed to decrypt XChaCha20-Poly1305 voice packet")]
     XChaCha20Poly1305DecryptFailed,
+    #[error("failed to encrypt XChaCha20-Poly1305 voice packet")]
     XChaCha20Poly1305EncryptFailed,
-    UnsupportedMode {
-        mode: EncryptionMode,
-        direction: TransportCryptoDirection,
-    },
 }
-
-impl fmt::Display for TransportCryptoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidSecretKeyLen { len } => {
-                write!(f, "voice secret_key must be 32 bytes, got {len}")
-            }
-            Self::MissingRtpSizeNonce {
-                packet_len,
-                min_len,
-            } => write!(
-                f,
-                "voice RTP packet is missing the RTP-size nonce suffix: {packet_len} bytes for minimum {min_len}",
-            ),
-            Self::InvalidAesGcmKey => f.write_str("invalid AES-GCM voice secret key"),
-            Self::InvalidXChaCha20Poly1305Key => {
-                f.write_str("invalid XChaCha20-Poly1305 voice secret key")
-            }
-            Self::AesGcmDecryptFailed => f.write_str("failed to decrypt AES-GCM voice packet"),
-            Self::AesGcmEncryptFailed => f.write_str("failed to encrypt AES-GCM voice packet"),
-            Self::XChaCha20Poly1305DecryptFailed => {
-                f.write_str("failed to decrypt XChaCha20-Poly1305 voice packet")
-            }
-            Self::XChaCha20Poly1305EncryptFailed => {
-                f.write_str("failed to encrypt XChaCha20-Poly1305 voice packet")
-            }
-            Self::UnsupportedMode { mode, direction } => {
-                write!(
-                    f,
-                    "unsupported voice encryption mode for {direction}: {mode:?}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for TransportCryptoError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportCryptoDirection {
@@ -775,91 +543,64 @@ impl fmt::Display for TransportCryptoDirection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, ThisError)]
 pub enum DaveError {
-    InvalidProtocolVersion {
-        version: u16,
-    },
-    CreateSession(InitError),
-    SetExternalSender(SetExternalSenderError),
-    CreateKeyPackage(CreateKeyPackageError),
-    ProcessProposals(ProcessProposalsError),
-    ProcessWelcome(ProcessWelcomeError),
-    ProcessCommit(ProcessCommitError),
+    #[error("unsupported DAVE protocol version {version}")]
+    InvalidProtocolVersion { version: u16 },
+    #[error("failed to create DAVE session: {0}")]
+    CreateSession(#[source] InitError),
+    #[error("failed to set DAVE external sender: {0}")]
+    SetExternalSender(#[source] SetExternalSenderError),
+    #[error("failed to create DAVE key package: {0}")]
+    CreateKeyPackage(#[source] CreateKeyPackageError),
+    #[error("failed to process DAVE proposals: {0}")]
+    ProcessProposals(#[source] ProcessProposalsError),
+    #[error("failed to process DAVE welcome: {0}")]
+    ProcessWelcome(#[source] ProcessWelcomeError),
+    #[error("failed to process DAVE commit: {0}")]
+    ProcessCommit(#[source] ProcessCommitError),
+    #[error("failed to update DAVE media ratchets: {0}")]
+    UpdateRatchets(#[source] UpdateRatchetsError),
+    #[error(
+        "failed to recover invalid DAVE group after {operation} error ({original}): {recovery}"
+    )]
     RecoverInvalidGroup {
         operation: &'static str,
+        #[source]
         original: Box<DaveError>,
         recovery: Box<Error>,
     },
-    InvalidGatewayPayload(DaveGatewayPayloadError),
-    InvalidProposalsPayload(DaveProposalsPayloadError),
-    Encrypt(EncryptError),
-    Decrypt(DaveDecryptError),
+    #[error("invalid DAVE gateway payload: {0}")]
+    InvalidGatewayPayload(#[source] DaveGatewayPayloadError),
+    #[error("invalid DAVE proposals payload: {0}")]
+    InvalidProposalsPayload(#[source] DaveProposalsPayloadError),
+    #[error("{0}")]
+    Encrypt(#[source] EncryptError),
+    #[error("{0}")]
+    Decrypt(#[source] DaveDecryptError),
 }
 
-impl fmt::Display for DaveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidProtocolVersion { version } => {
-                write!(f, "unsupported DAVE protocol version {version}")
-            }
-            Self::CreateSession(error) => write!(f, "failed to create DAVE session: {error}"),
-            Self::SetExternalSender(error) => {
-                write!(f, "failed to set DAVE external sender: {error}")
-            }
-            Self::CreateKeyPackage(error) => {
-                write!(f, "failed to create DAVE key package: {error}")
-            }
-            Self::ProcessProposals(error) => {
-                write!(f, "failed to process DAVE proposals: {error}")
-            }
-            Self::ProcessWelcome(error) => {
-                write!(f, "failed to process DAVE welcome: {error}")
-            }
-            Self::ProcessCommit(error) => write!(f, "failed to process DAVE commit: {error}"),
-            Self::RecoverInvalidGroup {
+impl DaveError {
+    pub(crate) fn recover_invalid_group(
+        operation: &'static str,
+        original: Self,
+        recovery: Error,
+    ) -> Error {
+        match recovery {
+            Error::Dave(_) => Self::RecoverInvalidGroup {
                 operation,
-                original,
-                recovery,
-            } => {
-                write!(
-                    f,
-                    "failed to recover invalid DAVE group after {operation} error ({original}): {recovery}",
-                )
+                original: Box::new(original),
+                recovery: Box::new(recovery),
             }
-            Self::InvalidGatewayPayload(error) => {
-                write!(f, "invalid DAVE gateway payload: {error}")
-            }
-            Self::InvalidProposalsPayload(error) => {
-                write!(f, "invalid DAVE proposals payload: {error}")
-            }
-            Self::Encrypt(error) => write!(f, "{error}"),
-            Self::Decrypt(error) => write!(f, "{error}"),
+            .into(),
+            _ => recovery,
         }
     }
 }
 
-impl std::error::Error for DaveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::CreateSession(error) => Some(error),
-            Self::SetExternalSender(error) => Some(error),
-            Self::CreateKeyPackage(error) => Some(error),
-            Self::ProcessProposals(error) => Some(error),
-            Self::ProcessWelcome(error) => Some(error),
-            Self::ProcessCommit(error) => Some(error),
-            Self::RecoverInvalidGroup { original, .. } => Some(original.as_ref()),
-            Self::InvalidGatewayPayload(error) => Some(error),
-            Self::InvalidProposalsPayload(error) => Some(error),
-            Self::Encrypt(error) => Some(error),
-            Self::Decrypt(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum DaveGatewayPayloadError {
+    #[error("opcode {opcode} payload is {len} bytes, expected at least {min_len}")]
     PayloadTooShort {
         opcode: u8,
         len: usize,
@@ -867,46 +608,20 @@ pub enum DaveGatewayPayloadError {
     },
 }
 
-impl fmt::Display for DaveGatewayPayloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PayloadTooShort {
-                opcode,
-                len,
-                min_len,
-            } => write!(
-                f,
-                "opcode {opcode} payload is {len} bytes, expected at least {min_len}",
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DaveGatewayPayloadError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum DaveProposalsPayloadError {
+    #[error("missing proposals operation byte")]
     MissingOperation,
+    #[error("invalid proposals operation byte {operation}")]
     InvalidOperation { operation: u8 },
 }
 
-impl fmt::Display for DaveProposalsPayloadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingOperation => f.write_str("missing proposals operation byte"),
-            Self::InvalidOperation { operation } => {
-                write!(f, "invalid proposals operation byte {operation}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DaveProposalsPayloadError {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ThisError)]
 pub enum DaveDecryptError {
+    #[error("DAVE frame decrypt requires mapped user_id")]
     MissingUser,
-    Source(DecryptError),
+    #[error("{0}")]
+    Source(#[source] DecryptError),
 }
 
 impl DaveDecryptError {
@@ -927,7 +642,6 @@ impl DaveDecryptError {
                 | FrameDecryptError::ReplayedNonce
                 | FrameDecryptError::MissingCryptor { .. }
                 | FrameDecryptError::Aead { .. }
-                | FrameDecryptError::OutputTooSmall { .. }
                 | FrameDecryptError::InvalidKey,
             )) => ReceiveDecodeErrorKind::DaveOtherDecryptError,
         }
@@ -940,24 +654,6 @@ impl DaveDecryptError {
                 FrameDecryptError::NoValidCryptor { .. }
             ))
         )
-    }
-}
-
-impl fmt::Display for DaveDecryptError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingUser => f.write_str("DAVE frame decrypt requires mapped user_id"),
-            Self::Source(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for DaveDecryptError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::MissingUser => None,
-            Self::Source(error) => Some(error),
-        }
     }
 }
 

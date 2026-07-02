@@ -29,43 +29,83 @@ pub enum PcmEncoding {
     ALaw,
 }
 
+#[derive(Clone, Copy)]
+struct PcmEncodingDescriptor {
+    encoding: PcmEncoding,
+    wire_name: &'static str,
+    sample_encoding_name: &'static str,
+    bytes_per_sample: usize,
+}
+
+const PCM_F32LE: PcmEncodingDescriptor = PcmEncodingDescriptor {
+    encoding: PcmEncoding::F32Le,
+    wire_name: "pcm_f32le",
+    sample_encoding_name: F32Le::NAME,
+    bytes_per_sample: std::mem::size_of::<f32>(),
+};
+
+const PCM_S16LE: PcmEncodingDescriptor = PcmEncodingDescriptor {
+    encoding: PcmEncoding::S16Le,
+    wire_name: "pcm_s16le",
+    sample_encoding_name: S16Le::NAME,
+    bytes_per_sample: std::mem::size_of::<i16>(),
+};
+
+const PCM_MULAW: PcmEncodingDescriptor = PcmEncodingDescriptor {
+    encoding: PcmEncoding::MuLaw,
+    wire_name: "pcm_mulaw",
+    sample_encoding_name: MuLaw::NAME,
+    bytes_per_sample: 1,
+};
+
+const PCM_ALAW: PcmEncodingDescriptor = PcmEncodingDescriptor {
+    encoding: PcmEncoding::ALaw,
+    wire_name: "pcm_alaw",
+    sample_encoding_name: ALaw::NAME,
+    bytes_per_sample: 1,
+};
+
+const PCM_ENCODINGS: [&PcmEncodingDescriptor; 4] = [&PCM_F32LE, &PCM_S16LE, &PCM_MULAW, &PCM_ALAW];
+
 impl PcmEncoding {
     pub fn parse(value: &str) -> Result<Self> {
         value.parse().map_err(Error::from)
     }
 
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::F32Le => "pcm_f32le",
-            Self::S16Le => "pcm_s16le",
-            Self::MuLaw => "pcm_mulaw",
-            Self::ALaw => "pcm_alaw",
-        }
+        self.descriptor().wire_name
     }
 
     pub const fn sample_encoding_name(self) -> &'static str {
-        match self {
-            Self::F32Le => F32Le::NAME,
-            Self::S16Le => S16Le::NAME,
-            Self::MuLaw => MuLaw::NAME,
-            Self::ALaw => ALaw::NAME,
-        }
+        self.descriptor().sample_encoding_name
     }
 
     pub const fn bytes_per_sample(self) -> usize {
-        match self {
-            Self::F32Le => 4,
-            Self::S16Le => 2,
-            Self::MuLaw | Self::ALaw => 1,
-        }
+        self.descriptor().bytes_per_sample
     }
 
     pub fn append_f32(self, data: &[u8], output: &mut Vec<f32>) -> Result<()> {
+        self.visit(AppendPcmF32 { data, output })
+    }
+
+    const fn descriptor(self) -> &'static PcmEncodingDescriptor {
         match self {
-            Self::F32Le => Samples::<F32Le>::append_f32(&data, output),
-            Self::S16Le => Samples::<S16Le>::append_f32(&data, output),
-            Self::MuLaw => Samples::<MuLaw>::append_f32(&data, output),
-            Self::ALaw => Samples::<ALaw>::append_f32(&data, output),
+            Self::F32Le => &PCM_F32LE,
+            Self::S16Le => &PCM_S16LE,
+            Self::MuLaw => &PCM_MULAW,
+            Self::ALaw => &PCM_ALAW,
+        }
+    }
+
+    fn visit<V>(self, visitor: V) -> V::Output
+    where
+        V: PcmEncodingVisitor,
+    {
+        match self {
+            Self::F32Le => visitor.visit::<F32Le>(),
+            Self::S16Le => visitor.visit::<S16Le>(),
+            Self::MuLaw => visitor.visit::<MuLaw>(),
+            Self::ALaw => visitor.visit::<ALaw>(),
         }
     }
 }
@@ -74,13 +114,12 @@ impl FromStr for PcmEncoding {
     type Err = PcmError;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "pcm_f32le" => Ok(Self::F32Le),
-            "pcm_s16le" => Ok(Self::S16Le),
-            "pcm_mulaw" => Ok(Self::MuLaw),
-            "pcm_alaw" => Ok(Self::ALaw),
-            _ => Err(PcmError::UnsupportedEncoding(value.to_string())),
+        for descriptor in PCM_ENCODINGS {
+            if value == descriptor.wire_name {
+                return Ok(descriptor.encoding);
+            }
         }
+        Err(PcmError::UnsupportedEncoding(value.to_string()))
     }
 }
 
@@ -90,11 +129,62 @@ impl std::fmt::Display for PcmEncoding {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PcmChunk {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PcmFormat {
     sample_rate_hz: NonZeroU32,
     channels: NonZeroUsize,
     encoding: PcmEncoding,
+}
+
+impl PcmFormat {
+    pub const fn new(
+        sample_rate_hz: NonZeroU32,
+        channels: NonZeroUsize,
+        encoding: PcmEncoding,
+    ) -> Self {
+        Self {
+            sample_rate_hz,
+            channels,
+            encoding,
+        }
+    }
+
+    pub fn from_parts(sample_rate_hz: u32, channels: usize, encoding: PcmEncoding) -> Result<Self> {
+        Ok(Self::new(
+            NonZeroU32::new(sample_rate_hz).ok_or(PcmError::SampleRateZero)?,
+            NonZeroUsize::new(channels).ok_or(PcmError::ChannelCountZero)?,
+            encoding,
+        ))
+    }
+
+    pub fn mono(sample_rate_hz: NonZeroU32, encoding: PcmEncoding) -> Self {
+        Self::new(
+            sample_rate_hz,
+            NonZeroUsize::new(1).expect("mono channel count is nonzero"),
+            encoding,
+        )
+    }
+
+    pub const fn sample_rate_hz(self) -> NonZeroU32 {
+        self.sample_rate_hz
+    }
+
+    pub const fn channels(self) -> NonZeroUsize {
+        self.channels
+    }
+
+    pub const fn encoding(self) -> PcmEncoding {
+        self.encoding
+    }
+
+    fn validate_bytes(self, byte_len: usize) -> Result<()> {
+        validate_pcm_bytes(self.encoding, byte_len, self.channels.get())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcmChunk {
+    format: PcmFormat,
     data: Arc<[u8]>,
 }
 
@@ -105,14 +195,13 @@ impl PcmChunk {
         encoding: PcmEncoding,
         data: impl Into<Arc<[u8]>>,
     ) -> Result<Self> {
+        Self::with_format(PcmFormat::new(sample_rate_hz, channels, encoding), data)
+    }
+
+    pub fn with_format(format: PcmFormat, data: impl Into<Arc<[u8]>>) -> Result<Self> {
         let data = data.into();
-        validate_pcm_bytes(encoding, data.len(), channels.get())?;
-        Ok(Self {
-            sample_rate_hz,
-            channels,
-            encoding,
-            data,
-        })
+        format.validate_bytes(data.len())?;
+        Ok(Self { format, data })
     }
 
     pub fn from_bytes(
@@ -121,10 +210,8 @@ impl PcmChunk {
         encoding: PcmEncoding,
         data: impl Into<Arc<[u8]>>,
     ) -> Result<Self> {
-        Self::new(
-            NonZeroU32::new(sample_rate_hz).ok_or(PcmError::SampleRateZero)?,
-            NonZeroUsize::new(channels).ok_or(PcmError::ChannelCountZero)?,
-            encoding,
+        Self::with_format(
+            PcmFormat::from_parts(sample_rate_hz, channels, encoding)?,
             data,
         )
     }
@@ -134,12 +221,7 @@ impl PcmChunk {
         encoding: PcmEncoding,
         data: impl Into<Arc<[u8]>>,
     ) -> Result<Self> {
-        Self::new(
-            sample_rate_hz,
-            NonZeroUsize::new(1).expect("mono channel count is nonzero"),
-            encoding,
-            data,
-        )
+        Self::with_format(PcmFormat::mono(sample_rate_hz, encoding), data)
     }
 
     pub fn from_mono_bytes(
@@ -151,15 +233,19 @@ impl PcmChunk {
     }
 
     pub const fn sample_rate_hz(&self) -> NonZeroU32 {
-        self.sample_rate_hz
+        self.format.sample_rate_hz()
     }
 
     pub const fn channels(&self) -> NonZeroUsize {
-        self.channels
+        self.format.channels()
     }
 
     pub const fn encoding(&self) -> PcmEncoding {
-        self.encoding
+        self.format.encoding()
+    }
+
+    pub const fn format(&self) -> PcmFormat {
+        self.format
     }
 
     pub fn data(&self) -> &[u8] {
@@ -183,20 +269,20 @@ impl PcmChunk {
     }
 
     pub fn sample_count(&self) -> usize {
-        self.data.len() / self.encoding.bytes_per_sample()
+        self.data.len() / self.format.encoding().bytes_per_sample()
     }
 
     pub fn frame_count(&self) -> usize {
-        self.sample_count() / self.channels.get()
+        self.sample_count() / self.format.channels().get()
     }
 
     pub fn append_f32(&self, output: &mut Vec<f32>) -> Result<usize> {
         let start = output.len();
         output.reserve(self.sample_count());
-        self.encoding.append_f32(&self.data, output)?;
+        self.format.encoding().append_f32(&self.data, output)?;
         let samples = output.len() - start;
-        validate_channel_alignment(self.channels.get(), samples)?;
-        Ok(samples / self.channels.get())
+        validate_channel_alignment(self.format.channels().get(), samples)?;
+        Ok(samples / self.format.channels().get())
     }
 }
 
@@ -208,6 +294,10 @@ impl AsRef<[u8]> for PcmChunk {
 
 pub trait SampleEncoding: Copy + Send + Sync + 'static {
     const NAME: &'static str;
+}
+
+pub trait ByteSampleEncoding: SampleEncoding {
+    const BYTES_PER_SAMPLE: usize;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -224,6 +314,10 @@ impl SampleEncoding for F32Le {
     const NAME: &'static str = "f32le";
 }
 
+impl ByteSampleEncoding for F32Le {
+    const BYTES_PER_SAMPLE: usize = std::mem::size_of::<f32>();
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct S16;
 
@@ -238,6 +332,10 @@ impl SampleEncoding for S16Le {
     const NAME: &'static str = "s16le";
 }
 
+impl ByteSampleEncoding for S16Le {
+    const BYTES_PER_SAMPLE: usize = std::mem::size_of::<i16>();
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MuLaw;
 
@@ -245,11 +343,86 @@ impl SampleEncoding for MuLaw {
     const NAME: &'static str = "mulaw";
 }
 
+impl ByteSampleEncoding for MuLaw {
+    const BYTES_PER_SAMPLE: usize = 1;
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ALaw;
 
 impl SampleEncoding for ALaw {
     const NAME: &'static str = "alaw";
+}
+
+impl ByteSampleEncoding for ALaw {
+    const BYTES_PER_SAMPLE: usize = 1;
+}
+
+trait RuntimePcmEncoding: ByteSampleEncoding {
+    fn append_f32(data: &[u8], output: &mut Vec<f32>) -> Result<()>;
+}
+
+impl RuntimePcmEncoding for F32Le {
+    fn append_f32(data: &[u8], output: &mut Vec<f32>) -> Result<()> {
+        Samples::<Self>::append_f32(&data, output)
+    }
+}
+
+impl RuntimePcmEncoding for S16Le {
+    fn append_f32(data: &[u8], output: &mut Vec<f32>) -> Result<()> {
+        Samples::<Self>::append_f32(&data, output)
+    }
+}
+
+impl RuntimePcmEncoding for MuLaw {
+    fn append_f32(data: &[u8], output: &mut Vec<f32>) -> Result<()> {
+        Samples::<Self>::append_f32(&data, output)
+    }
+}
+
+impl RuntimePcmEncoding for ALaw {
+    fn append_f32(data: &[u8], output: &mut Vec<f32>) -> Result<()> {
+        Samples::<Self>::append_f32(&data, output)
+    }
+}
+
+trait PcmEncodingVisitor {
+    type Output;
+
+    fn visit<E>(self) -> Self::Output
+    where
+        E: RuntimePcmEncoding;
+}
+
+struct AppendPcmF32<'data, 'output> {
+    data: &'data [u8],
+    output: &'output mut Vec<f32>,
+}
+
+impl PcmEncodingVisitor for AppendPcmF32<'_, '_> {
+    type Output = Result<()>;
+
+    fn visit<E>(self) -> Self::Output
+    where
+        E: RuntimePcmEncoding,
+    {
+        E::append_f32(self.data, self.output)
+    }
+}
+
+struct CheckedPcmByteSampleCount {
+    byte_len: usize,
+}
+
+impl PcmEncodingVisitor for CheckedPcmByteSampleCount {
+    type Output = Result<usize>;
+
+    fn visit<E>(self) -> Self::Output
+    where
+        E: RuntimePcmEncoding,
+    {
+        checked_byte_sample_count::<E>(self.byte_len)
+    }
 }
 
 pub trait Samples<E>
@@ -297,12 +470,12 @@ where
     T: AsRef<[u8]>,
 {
     fn sample_count(&self) -> Result<usize> {
-        checked_byte_sample_count::<F32Le>(self.as_ref().len(), std::mem::size_of::<f32>())
+        checked_byte_sample_count::<F32Le>(self.as_ref().len())
     }
 
     fn append_f32(&self, output: &mut Vec<f32>) -> Result<()> {
         let bytes = self.as_ref();
-        let samples = checked_byte_sample_count::<F32Le>(bytes.len(), std::mem::size_of::<f32>())?;
+        let samples = checked_byte_sample_count::<F32Le>(bytes.len())?;
         output.reserve(samples);
         output.extend(bytes.chunks_exact(4).map(|sample| {
             f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]).clamp(-1.0, 1.0)
@@ -316,12 +489,12 @@ where
     T: AsRef<[u8]>,
 {
     fn sample_count(&self) -> Result<usize> {
-        checked_byte_sample_count::<S16Le>(self.as_ref().len(), std::mem::size_of::<i16>())
+        checked_byte_sample_count::<S16Le>(self.as_ref().len())
     }
 
     fn append_f32(&self, output: &mut Vec<f32>) -> Result<()> {
         let bytes = self.as_ref();
-        let samples = checked_byte_sample_count::<S16Le>(bytes.len(), std::mem::size_of::<i16>())?;
+        let samples = checked_byte_sample_count::<S16Le>(bytes.len())?;
         output.reserve(samples);
         output.extend(
             bytes
@@ -800,11 +973,13 @@ pub fn decode_alaw(sample: u8) -> i16 {
     decoded.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
-pub fn decoded_frame_to_mono_s16le<Raw>(frame: &DecodedFrame<Raw>) -> Result<Vec<u8>>
+impl<Raw> DecodedFrame<Raw>
 where
     Raw: FrameRaw,
 {
-    interleaved_i16_to_mono_s16le(&frame.pcm, frame.channels)
+    pub fn to_mono_s16le_bytes(&self) -> Result<Vec<u8>> {
+        interleaved_i16_to_mono_s16le(&self.pcm, self.pcm_layout.channels)
+    }
 }
 
 pub fn interleaved_i16_to_mono_s16le(samples: &[i16], channels: usize) -> Result<Vec<u8>> {
@@ -820,7 +995,7 @@ pub fn interleaved_i16_to_mono_s16le(samples: &[i16], channels: usize) -> Result
 }
 
 pub fn s16le_rms(samples: &[u8]) -> Result<f32> {
-    checked_byte_sample_count::<S16Le>(samples.len(), std::mem::size_of::<i16>())?;
+    checked_byte_sample_count::<S16Le>(samples.len())?;
     let mut square_sum = 0_f64;
     let mut count = 0_u64;
     for sample in samples.chunks_exact(2) {
@@ -845,44 +1020,24 @@ pub fn validate_channel_alignment(channels: usize, samples: usize) -> Result<()>
     Ok(())
 }
 
-pub fn checked_byte_sample_count<E>(byte_len: usize, sample_bytes: usize) -> Result<usize>
+pub fn checked_byte_sample_count<E>(byte_len: usize) -> Result<usize>
 where
-    E: SampleEncoding,
+    E: ByteSampleEncoding,
 {
-    if !byte_len.is_multiple_of(sample_bytes) {
+    if !byte_len.is_multiple_of(E::BYTES_PER_SAMPLE) {
         return Err(PcmError::SampleAlignment {
             encoding: E::NAME,
             byte_len,
-            sample_bytes,
+            sample_bytes: E::BYTES_PER_SAMPLE,
         }
         .into());
     }
-    Ok(byte_len / sample_bytes)
+    Ok(byte_len / E::BYTES_PER_SAMPLE)
 }
 
 fn validate_pcm_bytes(encoding: PcmEncoding, byte_len: usize, channels: usize) -> Result<()> {
-    let sample_count = checked_byte_sample_count_by_name(
-        encoding.sample_encoding_name(),
-        byte_len,
-        encoding.bytes_per_sample(),
-    )?;
+    let sample_count = encoding.visit(CheckedPcmByteSampleCount { byte_len })?;
     validate_channel_alignment(channels, sample_count)
-}
-
-fn checked_byte_sample_count_by_name(
-    encoding: &'static str,
-    byte_len: usize,
-    sample_bytes: usize,
-) -> Result<usize> {
-    if !byte_len.is_multiple_of(sample_bytes) {
-        return Err(PcmError::SampleAlignment {
-            encoding,
-            byte_len,
-            sample_bytes,
-        }
-        .into());
-    }
-    Ok(byte_len / sample_bytes)
 }
 
 fn high_quality_sinc_resampler(

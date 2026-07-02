@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -9,7 +9,14 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
 };
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use dave::{DAVE_PROTOCOL_VERSION, DecryptError, FrameDecryptError, MediaType};
+use dave::{Codec, DAVE_PROTOCOL_VERSION, DecryptError, FrameDecryptError, MediaType};
+use openmls::prelude::{
+    BasicCredential, Ciphersuite, ExternalProposal, ExternalSender, GroupEpoch, GroupId,
+    KeyPackageIn, MlsMessageOut, OpenMlsProvider, ProtocolVersion, SenderExtensionIndex, VLBytes,
+    tls_codec::{Deserialize, Serialize},
+};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
 use opus_rs::{Application as OpusApplication, OpusEncoder as RawOpusEncoder};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -18,36 +25,37 @@ use tokio::{
 
 use crate::{
     AEAD_TAG_LEN, DAVE_SEND_MEDIA_READY_TIMEOUT, RTP_VERSION, RTPSIZE_NONCE_LEN,
+    codecs::{self, DiscordRtpCodecMap},
     connection::{
         Connection, ConnectionClose, ConnectionCommand, ConnectionInner, ConnectionStateStore,
-        PendingReceive, PlayoutCommand, ReadyFrameQueue, limit_raw_packet_result,
-        limit_voice_frame_result, spawn_voice_connection_join_task,
+        PendingReceive, PlayoutCommand, ReadyFrameQueue, spawn_voice_connection_join_task,
     },
     dave::{
-        DaveCoordinator, DavePreparedEpoch, dave_decrypt_failure_should_retry,
-        dave_receive_transform_active, dave_send_media_ready, dave_transition_zero_media_ready,
+        DaveCoordinator, DaveIdentityKey, DaveIgnoredProposalsEvent, DaveMediaStatus,
+        DavePreparedEpoch,
     },
     errors::{
         DaveDecryptError, DaveError, DaveGatewayPayloadError, Error, PayloadKind, RtpError,
         UnsupportedCodecError,
     },
     gateway::{
-        BinaryEvent, DaveTransitionReadyCommand, DiscordId, GatewayCommand, GatewayReady,
-        HeartbeatCommand, HelloData, Opcode, ParsedVoiceGatewayEvent, SpeakingCommand,
-        SpeakingFlags, UdpDiscoveryPacket, handle_voice_binary_event, handle_voice_text_event,
+        BinaryEvent, DaveTransitionReadyCommand, DiscordId, GatewayCommand, GatewayEventEffects,
+        GatewayEventHandler, GatewayHeartbeatAckState, GatewayReady, GatewayReadyStream,
+        HeartbeatCommand, HelloData, Opcode, ParsedVoiceGatewayEvent, SelectProtocolCommand,
+        SpeakingCommand, SpeakingFlags, UdpDiscoveryPacket, handle_voice_binary_event,
     },
     media::{
-        FrameRaw, MediaCodec, NoRawPackets, OutboundEncryptParams, RawFramePackets, RawUdpPacket,
-        RawUdpPacketInfo, ReceivedFrame, RtpHeader, build_rtp_header, decrypt_transport_payload,
-        detect_rtp_codec, encrypt_transport_payload, ordered_voice_socket_addrs, parse_rtp_header,
-        select_encryption_mode, udp_bind_addr_for_remote, update_state, websocket_host_port,
+        FrameRaw, NoRawPackets, OutboundEncryptParams, RawFramePackets, RawUdpPacket,
+        RawUdpPacketInfo, ReceivedFrame, RtpFrameAssembler, RtpHeader, RtpHeaderFields,
+        RtpSizeNonceSuffix, VoiceEndpoint, VoiceUdpRemote, build_rtp_header,
+        decrypt_transport_payload, encrypt_transport_payload, ordered_voice_socket_addrs,
     },
     observer::{
         ConnectionObserver, DavePendingMediaReason, NoopConnectionObserver, ReceiveDecodeErrorKind,
         ReceiveFrameDroppedEvent, ReceiveRtpPacketLossEvent, RtcpHeader,
     },
     opus::{
-        Decoder, PayloadCodec as OpusPayloadCodec,
+        Decoder,
         discord::{
             CHANNELS, EncodeConfig, MAX_PACKET_BYTES, PacketEncoder, PcmBlock, PcmEncoder,
             RTP_PAYLOAD_TYPE, SAMPLE_RATE_HZ, SAMPLES_PER_CHANNEL, STEREO_SAMPLES_PER_BLOCK,
@@ -58,16 +66,22 @@ use crate::{
         StereoInterleaved, interleaved_i16_to_mono_s16le, s16le_rms,
     },
     queue::DriverReply,
+    rtp::RtpPayloadType,
     state::{
-        ConnectionConfig, ConnectionInternalState, ConnectionOptions, ConnectionTuning,
-        DaveInternalState, DavePendingMediaRetry, EncryptionMode, PendingDaveMediaQueues,
-        PendingMediaFrame, PendingMediaPacket, ReceiveSsrcState, ReceiveState, SecretKey,
-        SessionDescription,
+        ConnectionCodecPreferences, ConnectionConfig, ConnectionInternalState, ConnectionOptions,
+        ConnectionTuning, DaveInternalState, DaveMlsMessageIdentity, DaveMlsMessageKind,
+        DavePendingMediaRetry, EncryptionMode, OfferedEncryptionMode, PendingDaveMediaQueues,
+        PendingDaveMlsMessage, PendingMediaFrame, PendingMediaPacket, ReceiveSsrcState,
+        ReceiveState, SecretKey, SessionDescription, SessionDescriptionParts,
     },
 };
 
 const TEST_DISCORD_ID: u64 = 0xDEADBEEF;
 const TEST_DISCORD_ID_JSON: &str = "3735928559";
+
+fn test_opus_payload_type() -> RtpPayloadType {
+    RtpPayloadType::new_const(RTP_PAYLOAD_TYPE)
+}
 
 type TestVoiceConnection = Connection<NoopConnectionObserver, NoRawPackets>;
 type TestPendingPacketReceive = PendingReceive<RawUdpPacket>;
@@ -88,19 +102,31 @@ fn test_connection_config() -> ConnectionConfig {
 
 fn test_state() -> ConnectionInternalState {
     let selected_mode = EncryptionMode::aead_aes256_gcm_rtpsize();
+    let config = test_connection_config()
+        .validate()
+        .unwrap()
+        .runtime_config();
+    let session_description = SessionDescription::new(SessionDescriptionParts {
+        mode: EncryptionMode::aead_aes256_gcm_rtpsize(),
+        secret_key: SecretKey::new(vec![0; 32]),
+        audio_codec: None,
+        video_codec: None,
+        dave_protocol_version: Some(1),
+    })
+    .unwrap();
+    let rtp_codecs =
+        DiscordRtpCodecMap::new(&session_description, &config.options.codec_preferences).unwrap();
     ConnectionInternalState {
-        config: test_connection_config()
-            .validate()
-            .unwrap()
-            .runtime_config(),
+        config,
         heartbeat_interval_ms: 50,
         last_seq: None,
         ready: GatewayReady {
             ssrc: 42,
             ip: "127.0.0.1".to_string(),
             port: 5000,
-            modes: vec![selected_mode.clone()],
+            modes: vec![selected_mode.into()],
             heartbeat_interval: None,
+            streams: Vec::new(),
         },
         discovery: UdpDiscoveryPacket {
             ssrc: 42,
@@ -108,15 +134,8 @@ fn test_state() -> ConnectionInternalState {
             port: 5001,
         },
         selected_mode,
-        session_description: Some(
-            SessionDescription::new(
-                EncryptionMode::aead_aes256_gcm_rtpsize(),
-                SecretKey::new(vec![0; 32]),
-                None,
-                Some(1),
-            )
-            .unwrap(),
-        ),
+        session_description: Some(session_description),
+        rtp_codecs: Some(rtp_codecs),
         connected_user_ids: Arc::new(HashSet::new()),
         ssrc_users: Arc::new(HashMap::new()),
         speaking: Arc::new(HashMap::new()),
@@ -126,8 +145,28 @@ fn test_state() -> ConnectionInternalState {
     }
 }
 
+fn test_pending_mls(kind: DaveMlsMessageKind) -> PendingDaveMlsMessage {
+    PendingDaveMlsMessage::new(
+        DaveMlsMessageIdentity {
+            kind,
+            seq: 7,
+            transition_id: 8,
+        },
+        vec![0xad],
+    )
+}
+
 fn test_state_store() -> ConnectionStateStore {
     ConnectionStateStore::new(test_state())
+}
+
+fn handle_test_voice_text_event(
+    state: &mut ConnectionStateStore,
+    event: ParsedVoiceGatewayEvent,
+) -> crate::Result<GatewayEventEffects> {
+    let mut heartbeat_ack = GatewayHeartbeatAckState::default();
+    GatewayEventHandler::new(state, &mut heartbeat_ack, &NoopConnectionObserver)
+        .handle_text_event(event)
 }
 
 async fn test_connection_with_state(state: ConnectionInternalState) -> TestVoiceConnection {
@@ -203,6 +242,7 @@ fn default_config_uses_dave_protocol_version() {
         config.options().dave_send_media_ready_timeout,
         DAVE_SEND_MEDIA_READY_TIMEOUT
     );
+    assert_eq!(config.options().dave_identity, None);
 }
 
 #[tokio::test]
@@ -264,8 +304,9 @@ async fn send_returns_closed_after_connection_closes() {
 #[tokio::test]
 async fn wait_until_media_ready_returns_closed_after_connection_closes() {
     let mut state = test_state();
-    state.dave.protocol_version = Some(DAVE_PROTOCOL_VERSION.get());
-    state.dave.passthrough = false;
+    state
+        .dave
+        .set_session_protocol(Some(DAVE_PROTOCOL_VERSION.get()));
     let connection = test_connection_with_state(state).await;
 
     assert!(connection.close());
@@ -286,6 +327,7 @@ fn receive_rtp_reorders_adjacent_packets_without_loss() {
         receive
             .push_media_packet(&observer, test_pending_media(7, 7))
             .unwrap()
+            .unwrap()
             .rtp
             .seq,
         7
@@ -293,6 +335,7 @@ fn receive_rtp_reorders_adjacent_packets_without_loss() {
     assert!(
         receive
             .push_media_packet(&observer, test_pending_media(7, 9))
+            .unwrap()
             .is_none()
     );
     assert_eq!(observer.loss_count(), 0);
@@ -300,14 +343,24 @@ fn receive_rtp_reorders_adjacent_packets_without_loss() {
         receive
             .push_media_packet(&observer, test_pending_media(7, 8))
             .unwrap()
+            .unwrap()
             .rtp
             .seq,
         8
     );
-    assert_eq!(receive.drain_ordered_media(&observer).unwrap().rtp.seq, 9);
+    assert_eq!(
+        receive
+            .drain_ordered_media(&observer)
+            .unwrap()
+            .unwrap()
+            .rtp
+            .seq,
+        9
+    );
     assert_eq!(
         receive
             .push_media_packet(&observer, test_pending_media(7, 10))
+            .unwrap()
             .unwrap()
             .rtp
             .seq,
@@ -325,6 +378,7 @@ fn receive_rtp_reports_loss_only_after_reorder_window_expires() {
         receive
             .push_media_packet(&observer, test_pending_media(7, 7))
             .unwrap()
+            .unwrap()
             .rtp
             .seq,
         7
@@ -332,6 +386,7 @@ fn receive_rtp_reports_loss_only_after_reorder_window_expires() {
     assert!(
         receive
             .push_media_packet(&observer, test_pending_media(7, 9))
+            .unwrap()
             .is_none()
     );
     assert!(receive.drain_ordered_media(&observer).is_none());
@@ -346,7 +401,15 @@ fn receive_rtp_reports_loss_only_after_reorder_window_expires() {
         Instant::now() - ConnectionTuning::default().rtp_reorder_ttl - Duration::from_millis(1);
     receive.refresh_ssrc_schedules(7);
 
-    assert_eq!(receive.drain_ordered_media(&observer).unwrap().rtp.seq, 9);
+    assert_eq!(
+        receive
+            .drain_ordered_media(&observer)
+            .unwrap()
+            .unwrap()
+            .rtp
+            .seq,
+        9
+    );
     assert_eq!(observer.loss_count(), 1);
     assert_eq!(observer.first_seq(), 8);
     assert_eq!(observer.last_seq(), 8);
@@ -391,7 +454,7 @@ fn receive_max_len_is_applied_after_packet_capture() {
     let raw = RawUdpPacket::from_bytes(vec![0xde, 0xad, 0xbe, 0xef]);
 
     assert!(matches!(
-        limit_raw_packet_result(raw, 3, PayloadKind::RawUdpPacket),
+        raw.ensure_len_at_most(3, PayloadKind::RawUdpPacket),
         Err(Error::PayloadTooLarge {
             kind: PayloadKind::RawUdpPacket,
             len: 4,
@@ -399,7 +462,7 @@ fn receive_max_len_is_applied_after_packet_capture() {
         })
     ));
     assert!(matches!(
-        limit_voice_frame_result(Ok(test_received_frame(vec![0xde, 0xad])), 1),
+        test_received_frame(vec![0xde, 0xad]).ensure_len_at_most(1),
         Err(Error::PayloadTooLarge {
             kind: PayloadKind::Frame,
             len: 2,
@@ -414,7 +477,7 @@ fn public_state_snapshots_keep_roster_maps_immutable() {
     let receiver = state.subscribe_public();
     let before = receiver.borrow().clone();
 
-    update_state(&mut state, |state| {
+    state.update(|state| {
         state.connected_user_ids_mut().insert(TEST_DISCORD_ID);
         state.ssrc_users_mut().insert(123, TEST_DISCORD_ID);
         state.ready.ssrc = 777;
@@ -438,14 +501,16 @@ fn receive_raw_packet_retention_is_type_selected() {
         compact_receive
             .push_media_packet(&observer, test_pending_media(7, 1))
             .unwrap()
+            .unwrap()
             .raw,
         NoRawPackets,
     );
 
     let mut raw_receive = ReceiveState::<RawFramePackets>::default();
-    let raw_bytes = build_rtp_header(1, 960, 7, RTP_PAYLOAD_TYPE);
+    let raw_bytes = build_rtp_header(1, 960, 7, test_opus_payload_type());
     let frame = raw_receive
         .push_media_packet(&observer, test_pending_raw_media(7, 1, raw_bytes.clone()))
+        .unwrap()
         .unwrap();
 
     assert_eq!(frame.raw.packets.len(), 1);
@@ -454,29 +519,135 @@ fn receive_raw_packet_retention_is_type_selected() {
 }
 
 #[test]
-fn rtp_codec_detection_accepts_only_opus_audio_payloads() {
-    let mut session_description = test_state().session_description.unwrap();
-    let rtp = test_rtp_header(RTP_PAYLOAD_TYPE);
+fn av1_receive_uses_timestamp_change_to_finish_markerless_temporal_unit() {
+    let observer = NoopConnectionObserver;
+    let mut receive = TestReceiveState::default();
 
-    assert_eq!(
-        detect_rtp_codec(&rtp, &session_description).unwrap(),
-        MediaCodec::Opus
+    assert!(
+        receive
+            .push_media_packet(
+                &observer,
+                test_pending_video_media(7, 1, 90_000, Codec::Av1, false, vec![0x10, 0xaa])
+            )
+            .unwrap()
+            .is_none()
     );
+    assert!(
+        receive
+            .push_media_packet(
+                &observer,
+                test_pending_video_media(7, 2, 90_000, Codec::Av1, false, vec![0x10, 0xbb])
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    let first = receive
+        .push_media_packet(
+            &observer,
+            test_pending_video_media(7, 3, 180_000, Codec::Av1, true, vec![0x10, 0xcc]),
+        )
+        .unwrap()
+        .unwrap();
+    let second = receive.drain_ordered_media(&observer).unwrap().unwrap();
+
+    assert_eq!(first.rtp.seq, 1);
+    assert_eq!(first.encrypted_frame, [0xaa, 0xbb]);
+    assert_eq!(second.rtp.seq, 3);
+    assert_eq!(second.encrypted_frame, [0xcc]);
+}
+
+#[test]
+fn rtp_frame_assembler_drops_non_contiguous_fragmented_frame() {
+    let mut assembler = RtpFrameAssembler::<NoRawPackets>::default();
+
+    assert!(
+        assembler
+            .push_packet(test_pending_video_media(
+                7,
+                1,
+                90_000,
+                Codec::Vp8,
+                false,
+                vec![0x10, 0xaa],
+            ))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        assembler
+            .push_packet(test_pending_video_media(
+                7,
+                3,
+                90_000,
+                Codec::Vp8,
+                true,
+                vec![0x00, 0xbb],
+            ))
+            .unwrap()
+            .is_none()
+    );
+
+    let frame = assembler
+        .push_packet(test_pending_video_media(
+            7,
+            4,
+            180_000,
+            Codec::Vp8,
+            true,
+            vec![0x10, 0xcc],
+        ))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(frame.rtp.seq, 4);
+    assert_eq!(frame.encrypted_frame, [0xcc]);
+}
+
+#[test]
+fn rtp_codec_detection_accepts_negotiated_audio_and_video_payloads() {
+    let mut session_description = test_state().session_description.unwrap();
+    let codec_preferences =
+        ConnectionCodecPreferences::with_video_codecs([Codec::Av1, Codec::H264]).unwrap();
+    let codec_map = DiscordRtpCodecMap::new(&session_description, &codec_preferences).unwrap();
+    let rtp = test_rtp_header(test_opus_payload_type());
+
+    assert_eq!(codec_map.detect(rtp.payload_type).unwrap(), Codec::Opus);
 
     session_description.audio_codec = Some("aac".to_string());
     assert!(matches!(
-        detect_rtp_codec(&rtp, &session_description),
+        DiscordRtpCodecMap::new(&session_description, &codec_preferences),
         Err(UnsupportedCodecError::UnsupportedAudioCodec { codec }) if codec == "aac"
     ));
 
     session_description.audio_codec = Some("opus".to_string());
+    session_description.video_codec = Some("AV1".to_string());
+    let codec_map = DiscordRtpCodecMap::new(&session_description, &codec_preferences).unwrap();
+    assert_eq!(
+        codec_map
+            .detect(test_rtp_header(codecs::payload_type(Codec::Av1)).payload_type)
+            .unwrap(),
+        Codec::Av1
+    );
+    assert_eq!(
+        codec_map
+            .detect(test_rtp_header(codecs::payload_type(Codec::H264)).payload_type)
+            .unwrap(),
+        Codec::H264
+    );
+
     assert!(matches!(
-        detect_rtp_codec(&test_rtp_header(RTP_PAYLOAD_TYPE + 1), &session_description),
-        Err(UnsupportedCodecError::UnsupportedRtpPayloadType {
+        codec_map.detect(test_rtp_header(codecs::payload_type(Codec::Vp8)).payload_type),
+        Err(UnsupportedCodecError::UnexpectedRtpPayloadCodec {
             payload_type,
-            expected_payload_type: RTP_PAYLOAD_TYPE,
-            codec: MediaCodec::Opus,
-        }) if payload_type == RTP_PAYLOAD_TYPE + 1
+            codec: Codec::Vp8,
+            expected_payload_types,
+        }) if payload_type == codecs::payload_type(Codec::Vp8)
+            && expected_payload_types == vec![
+                test_opus_payload_type(),
+                codecs::payload_type(Codec::Av1),
+                codecs::payload_type(Codec::H264),
+            ]
     ));
 }
 
@@ -485,7 +656,7 @@ fn missing_dave_user_is_typed_error() {
     let mut dave = DaveCoordinator::new(1, 2).unwrap();
     let mut output = Vec::new();
     assert_eq!(
-        dave.decrypt_media_frame_into::<OpusPayloadCodec>(None, b"frame", &mut output)
+        dave.decrypt_media_frame_into(None, MediaType::Audio, b"frame", &mut output)
             .unwrap_err(),
         DaveDecryptError::MissingUser
     );
@@ -514,6 +685,173 @@ fn dave_no_valid_cryptor_error_preserves_details() {
     );
 }
 
+fn test_external_sender_with_signer() -> (SignatureKeyPair, Vec<u8>) {
+    let signer = SignatureKeyPair::new(
+        Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256.signature_algorithm(),
+    )
+    .unwrap();
+    let external_sender = ExternalSender::new(
+        signer.public().into(),
+        BasicCredential::new(0xDEADBEEF_u64.to_be_bytes().into()).into(),
+    )
+    .tls_serialize_detached()
+    .unwrap();
+    (signer, external_sender)
+}
+
+fn test_external_sender() -> Vec<u8> {
+    test_external_sender_with_signer().1
+}
+
+fn test_proposal_vector(messages: impl IntoIterator<Item = MlsMessageOut>) -> Vec<u8> {
+    let mut proposals = Vec::new();
+    for message in messages {
+        proposals.extend_from_slice(&message.tls_serialize_detached().unwrap());
+    }
+    VLBytes::new(proposals).tls_serialize_detached().unwrap()
+}
+
+fn test_dave_append_add_proposal(
+    key_package: &[u8],
+    signer: &SignatureKeyPair,
+    channel_id: u64,
+    epoch: u64,
+) -> Vec<u8> {
+    let provider = OpenMlsRustCrypto::default();
+    let mut key_package_bytes = key_package;
+    let key_package = KeyPackageIn::tls_deserialize(&mut key_package_bytes)
+        .unwrap()
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    let add = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+        key_package,
+        GroupId::from_slice(&channel_id.to_be_bytes()),
+        GroupEpoch::from(epoch),
+        signer,
+        SenderExtensionIndex::new(0),
+    )
+    .unwrap();
+    let proposals = test_proposal_vector([add]);
+    let mut payload = Vec::with_capacity(proposals.len() + 1);
+    payload.push(0);
+    payload.extend_from_slice(&proposals);
+    payload
+}
+
+#[derive(Clone, Default)]
+struct TestDaveProposalObserver {
+    ignored: Arc<Mutex<Vec<String>>>,
+}
+
+impl TestDaveProposalObserver {
+    fn ignored(&self) -> Vec<String> {
+        self.ignored.lock().unwrap().clone()
+    }
+}
+
+impl ConnectionObserver for TestDaveProposalObserver {
+    fn dave_proposals_ignored(&self, event: DaveIgnoredProposalsEvent<'_>) {
+        self.ignored.lock().unwrap().push(event.error.to_string());
+    }
+}
+
+#[test]
+fn dave_sole_member_reset_transition_zero_creates_pending_local_group() {
+    let mut state = DaveInternalState::default();
+    state.prepare_epoch(1, 1);
+    state.external_sender = Some(test_external_sender());
+    state.prepare_transition(0, 1);
+
+    let mut dave = DaveCoordinator::new(1, 2).unwrap();
+    let commands = dave
+        .pump(&state, &HashSet::from([1]), true, &NoopConnectionObserver)
+        .unwrap();
+
+    assert!(commands.iter().any(|command| {
+        matches!(
+            command,
+            GatewayCommand::DaveMlsKeyPackage { key_package } if !key_package.is_empty()
+        )
+    }));
+    assert!(!dave.ready());
+    assert!(!dave.send_ready());
+    assert_eq!(dave.transition_ready(), None);
+}
+
+#[test]
+fn dave_prepare_epoch_keeps_established_transition_zero_sender() {
+    let (gateway_signer, external_sender) = test_external_sender_with_signer();
+    let mut state = DaveInternalState::default();
+    state.prepare_epoch(1, 1);
+    state.external_sender = Some(external_sender);
+    state.prepare_transition(0, 1);
+
+    let mut dave = DaveCoordinator::new(1, 2).unwrap();
+    let observer = TestDaveProposalObserver::default();
+    let commands = dave
+        .pump(&state, &HashSet::from([1]), true, &observer)
+        .unwrap();
+    let key_package = commands
+        .iter()
+        .find_map(|command| match command {
+            GatewayCommand::DaveMlsKeyPackage { key_package } => Some(key_package.as_slice()),
+            _ => None,
+        })
+        .expect("initial pump sends our DAVE key package");
+    assert!(!key_package.is_empty());
+
+    let mut joining_user = ::dave::Session::new(::dave::SessionConfig {
+        self_user_id: 4,
+        channel_id: 2,
+        options: ::dave::SessionOptions::default(),
+    })
+    .unwrap();
+    let joining_key_package = joining_user.create_key_package().unwrap();
+    state.proposals.push(test_dave_append_add_proposal(
+        &joining_key_package,
+        &gateway_signer,
+        2,
+        0,
+    ));
+    let commands = dave
+        .pump(&state, &HashSet::from([1, 4]), true, &observer)
+        .unwrap();
+    let commit = commands
+        .into_iter()
+        .find_map(|command| match command {
+            GatewayCommand::DaveMlsCommitWelcome { commit, .. } => Some(commit),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "processing our add proposal creates a commit: {:?}",
+                observer.ignored()
+            )
+        });
+
+    state.proposals.clear();
+    state.pending_mls.set_message(PendingDaveMlsMessage::new(
+        DaveMlsMessageIdentity {
+            kind: DaveMlsMessageKind::Commit,
+            seq: 1,
+            transition_id: 0,
+        },
+        commit,
+    ));
+    dave.pump(&state, &HashSet::from([1, 4]), true, &observer)
+        .unwrap();
+
+    assert!(dave.ready());
+    assert!(dave.send_ready());
+
+    state.prepare_epoch(1, 1);
+    dave.pump(&state, &HashSet::from([1, 4]), true, &observer)
+        .unwrap();
+
+    assert!(dave.ready());
+    assert!(dave.send_ready());
+}
+
 #[test]
 fn heartbeat_payload_includes_seq_ack() {
     let payload = GatewayCommand::Heartbeat(HeartbeatCommand {
@@ -532,17 +870,21 @@ fn heartbeat_payload_includes_seq_ack() {
 }
 
 #[test]
-fn websocket_host_port_uses_discord_endpoint_port() {
+fn voice_endpoint_host_port_uses_discord_endpoint_port() {
     assert_eq!(
-        websocket_host_port("wss://c-syd05-e6e612f0.discord.media:2053/?v=8").unwrap(),
+        VoiceEndpoint::new("wss://c-syd05-e6e612f0.discord.media:2053/?v=8")
+            .host_port()
+            .unwrap(),
         ("c-syd05-e6e612f0.discord.media".to_string(), 2053)
     );
 }
 
 #[test]
-fn websocket_host_port_defaults_wss_to_443() {
+fn voice_endpoint_host_port_defaults_wss_to_443() {
     assert_eq!(
-        websocket_host_port("wss://example.discord.media/?v=8").unwrap(),
+        VoiceEndpoint::new("wss://example.discord.media/?v=8")
+            .host_port()
+            .unwrap(),
         ("example.discord.media".to_string(), 443)
     );
 }
@@ -568,11 +910,11 @@ fn ordered_voice_socket_addrs_deduplicates_and_prefers_ipv4() {
 #[test]
 fn udp_bind_addr_matches_remote_ip_family() {
     assert_eq!(
-        udp_bind_addr_for_remote("127.0.0.1".parse().unwrap()),
+        VoiceUdpRemote::new("127.0.0.1".parse().unwrap()).bind_addr(),
         "0.0.0.0:0".parse().unwrap()
     );
     assert_eq!(
-        udp_bind_addr_for_remote("::1".parse().unwrap()),
+        VoiceUdpRemote::new("::1".parse().unwrap()).bind_addr(),
         "[::]:0".parse().unwrap()
     );
 }
@@ -599,7 +941,7 @@ fn dave_transition_ready_payload_contains_transition_id() {
 }
 
 #[test]
-fn dave_transition_ready_payload_allows_initial_transition() {
+fn dave_transition_ready_payload_serializes_transition_zero() {
     let payload = GatewayCommand::DaveProtocolTransitionReady(DaveTransitionReadyCommand {
         transition_id: 0,
     })
@@ -612,6 +954,45 @@ fn dave_transition_ready_payload_allows_initial_transition() {
             Opcode::DaveTransitionReady.code()
         )
     );
+}
+
+#[test]
+fn dave_init_transition_zero_marks_local_ready_without_gateway_command() {
+    let mut dave = DaveCoordinator::new(1, 2).unwrap();
+    let mut commands = Vec::new();
+
+    dave.mark_transition_ready(&mut commands, &NoopConnectionObserver, Some(0), Some(1));
+
+    assert_eq!(dave.transition_ready(), Some(0));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn dave_disabled_init_transition_zero_marks_local_ready_without_gateway_command() {
+    let mut dave = DaveCoordinator::new(1, 2).unwrap();
+    let mut commands = Vec::new();
+
+    dave.mark_transition_ready(&mut commands, &NoopConnectionObserver, Some(0), Some(0));
+
+    assert_eq!(dave.transition_ready(), Some(0));
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn dave_nonzero_transition_ready_sends_gateway_command() {
+    let mut dave = DaveCoordinator::new(1, 2).unwrap();
+    let mut commands = Vec::new();
+
+    dave.mark_transition_ready(&mut commands, &NoopConnectionObserver, Some(7), Some(1));
+
+    assert_eq!(dave.transition_ready(), Some(7));
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(
+        commands.first(),
+        Some(GatewayCommand::DaveProtocolTransitionReady(
+            DaveTransitionReadyCommand { transition_id: 7 },
+        ))
+    ));
 }
 
 #[test]
@@ -634,6 +1015,74 @@ fn speaking_payload_matches_discord_shape() {
 }
 
 #[test]
+fn select_protocol_codecs_are_top_level_discord_wire_metadata() {
+    let codec_preferences =
+        ConnectionCodecPreferences::with_video_codecs([Codec::Av1, Codec::H264]).unwrap();
+    let payload = GatewayCommand::SelectProtocol(SelectProtocolCommand::udp(
+        "127.0.0.1".to_string(),
+        5000,
+        EncryptionMode::aead_aes256_gcm_rtpsize(),
+        &codec_preferences,
+    ))
+    .text_payload()
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let data = &payload["d"];
+
+    assert_eq!(data["protocol"], "udp");
+    assert!(data["data"].get("codecs").is_none());
+    assert_eq!(data["data"]["address"], "127.0.0.1");
+    assert_eq!(data["data"]["port"], 5000);
+
+    let codecs = data["codecs"].as_array().unwrap();
+    assert_eq!(codecs[0]["name"], "opus");
+    assert_eq!(codecs[0]["type"], "audio");
+    assert_eq!(codecs[0]["priority"], 1_000);
+    assert_eq!(codecs[1]["name"], "AV1");
+    assert_eq!(codecs[1]["priority"], 2_000);
+    assert_eq!(
+        codecs[1]["payload_type"],
+        codecs::payload_type(Codec::Av1).get()
+    );
+    assert_eq!(codecs[1]["rtx_payload_type"], 102);
+    assert_eq!(codecs[2]["name"], "H264");
+    assert_eq!(codecs[2]["priority"], 3_000);
+}
+
+#[test]
+fn ready_primary_video_stream_matches_identify_rid_and_keeps_rtx() {
+    let ready = GatewayReady {
+        ssrc: 42,
+        ip: "127.0.0.1".to_string(),
+        port: 5000,
+        modes: vec![EncryptionMode::aead_aes256_gcm_rtpsize().into()],
+        heartbeat_interval: None,
+        streams: vec![
+            GatewayReadyStream {
+                kind: Some("video".to_string()),
+                rid: Some("50".to_string()),
+                ssrc: 50,
+                rtx_ssrc: Some(51),
+                quality: Some(50),
+                active: Some(true),
+            },
+            GatewayReadyStream {
+                kind: Some("video".to_string()),
+                rid: Some("100".to_string()),
+                ssrc: 100,
+                rtx_ssrc: Some(101),
+                quality: Some(100),
+                active: Some(true),
+            },
+        ],
+    };
+    let stream = ready.primary_video_stream().unwrap();
+
+    assert_eq!(stream.ssrc, 100);
+    assert_eq!(stream.rtx_ssrc, Some(101));
+}
+
+#[test]
 fn dave_mls_commands_do_not_have_json_fallback_payloads() {
     let error = GatewayCommand::DaveMlsKeyPackage {
         key_package: vec![0xde, 0xad],
@@ -646,12 +1095,13 @@ fn dave_mls_commands_do_not_have_json_fallback_payloads() {
 
 #[test]
 fn session_description_debug_and_json_do_not_expose_secret_key() {
-    let description = SessionDescription::new(
-        EncryptionMode::aead_aes256_gcm_rtpsize(),
-        SecretKey::new(vec![0xde; 32]),
-        Some("opus".to_string()),
-        Some(1),
-    )
+    let description = SessionDescription::new(SessionDescriptionParts {
+        mode: EncryptionMode::aead_aes256_gcm_rtpsize(),
+        secret_key: SecretKey::new(vec![0xde; 32]),
+        audio_codec: Some("opus".to_string()),
+        video_codec: Some("AV1".to_string()),
+        dave_protocol_version: Some(1),
+    })
     .unwrap();
 
     let debug = format!("{description:?}");
@@ -667,21 +1117,20 @@ fn session_description_debug_and_json_do_not_expose_secret_key() {
 
 #[test]
 fn unsupported_voice_encryption_modes_fail_selection() {
-    let options = ConnectionOptions::default();
-    let error = select_encryption_mode(
-        &options,
-        &GatewayReady {
-            ssrc: 42,
-            ip: "127.0.0.1".to_string(),
-            port: 5000,
-            modes: vec![EncryptionMode::new("xsalsa20_poly1305_lite")],
-            heartbeat_interval: None,
-        },
-    )
+    let options = ConnectionOptions::default().validate().unwrap();
+    let error = GatewayReady {
+        ssrc: 42,
+        ip: "127.0.0.1".to_string(),
+        port: 5000,
+        modes: vec![OfferedEncryptionMode::new("xsalsa20_poly1305_lite")],
+        heartbeat_interval: None,
+        streams: Vec::new(),
+    }
+    .select_encryption_mode(&options)
     .unwrap_err()
     .to_string();
 
-    assert!(error.contains("supported encryption mode"));
+    assert!(error.contains("required voice encryption mode"));
 }
 
 #[test]
@@ -726,17 +1175,20 @@ fn raw_udp_packet_parses_rtcp_header() {
 
 fn transport_crypto_round_trips(mode: EncryptionMode) {
     let opus = b"opus-frame";
-    let nonce_suffix = [0xde, 0xad, 0xbe, 0xef];
+    let nonce_suffix = RtpSizeNonceSuffix::from_be_bytes([0xde, 0xad, 0xbe, 0xef]);
     let packet = encrypt_transport_payload(
         OutboundEncryptParams {
-            seq: 10,
-            timestamp: 20,
-            ssrc: 30,
-            payload_type: RTP_PAYLOAD_TYPE,
+            header: RtpHeaderFields {
+                seq: 10,
+                timestamp: 20,
+                ssrc: 30,
+                payload_type: test_opus_payload_type(),
+            },
+            marker: false,
             nonce_suffix,
         },
         opus.to_vec(),
-        &mode,
+        mode,
         &[7; 32],
     )
     .unwrap();
@@ -745,11 +1197,14 @@ fn transport_crypto_round_trips(mode: EncryptionMode) {
         packet.len(),
         12 + opus.len() + AEAD_TAG_LEN + RTPSIZE_NONCE_LEN
     );
-    assert_eq!(&packet[packet.len() - RTPSIZE_NONCE_LEN..], &nonce_suffix);
-
-    let rtp = parse_rtp_header(&packet).unwrap();
     assert_eq!(
-        decrypt_transport_payload(&packet, &rtp, &mode, &[7; 32]).unwrap(),
+        &packet[packet.len() - RTPSIZE_NONCE_LEN..],
+        &nonce_suffix.to_be_bytes()
+    );
+
+    let rtp = RtpHeader::parse(&packet).unwrap();
+    assert_eq!(
+        decrypt_transport_payload(&packet, &rtp, mode, &[7; 32]).unwrap(),
         opus
     );
 }
@@ -759,13 +1214,13 @@ fn transport_crypto_decrypts_rtp_extensions(mode: EncryptionMode) {
     let key = [7; 32];
     let nonce_suffix = [0xde, 0xad, 0xbe, 0xef];
     let packet = TestEncryptedRtpPacket::with_extension(&mode, &key, nonce_suffix, opus);
-    let rtp = parse_rtp_header(&packet.bytes).unwrap();
+    let rtp = RtpHeader::parse(&packet.bytes).unwrap();
 
     assert!(rtp.extension);
     assert_eq!(rtp.encrypted_body_offset, 16);
     assert_eq!(rtp.header_len, 20);
     assert_eq!(
-        decrypt_transport_payload(&packet.bytes, &rtp, &mode, &key).unwrap(),
+        decrypt_transport_payload(&packet.bytes, &rtp, mode, &key).unwrap(),
         opus
     );
 }
@@ -775,11 +1230,11 @@ fn transport_crypto_strips_rtp_padding(mode: EncryptionMode) {
     let key = [7; 32];
     let nonce_suffix = [0xde, 0xad, 0xbe, 0xef];
     let packet = TestEncryptedRtpPacket::with_padding(&mode, &key, nonce_suffix, opus);
-    let rtp = parse_rtp_header(&packet.bytes).unwrap();
+    let rtp = RtpHeader::parse(&packet.bytes).unwrap();
 
     assert!(rtp.padding);
     assert_eq!(
-        decrypt_transport_payload(&packet.bytes, &rtp, &mode, &key).unwrap(),
+        decrypt_transport_payload(&packet.bytes, &rtp, mode, &key).unwrap(),
         opus
     );
 }
@@ -790,7 +1245,7 @@ fn rtp_parser_rejects_unsupported_version() {
     packet[0] = 1 << 6;
 
     assert_eq!(
-        parse_rtp_header(&packet),
+        RtpHeader::parse(&packet),
         Err(RtpError::UnsupportedVersion { version: 1 })
     );
 }
@@ -817,7 +1272,7 @@ fn opus_round_trip_decodes_one_discord_frame() {
                 padding: false,
                 extension: false,
                 marker: false,
-                payload_type: RTP_PAYLOAD_TYPE,
+                payload_type: test_opus_payload_type(),
                 seq: 0,
                 timestamp: 0,
                 ssrc: 0,
@@ -826,14 +1281,14 @@ fn opus_round_trip_decodes_one_discord_frame() {
             },
             user_id: Some(1),
             media_type: MediaType::Audio,
-            codec: MediaCodec::Opus,
-            frame: opus.bytes,
+            codec: Codec::Opus,
+            frame: opus.into_bytes(),
         })
         .unwrap();
 
-    assert_eq!(decoded.sample_rate, SAMPLE_RATE_HZ);
-    assert_eq!(decoded.channels, CHANNELS);
-    assert_eq!(decoded.samples_per_channel, SAMPLES_PER_CHANNEL);
+    assert_eq!(decoded.pcm_layout.sample_rate_hz, SAMPLE_RATE_HZ);
+    assert_eq!(decoded.pcm_layout.channels, CHANNELS);
+    assert_eq!(decoded.pcm_layout.samples_per_channel, SAMPLES_PER_CHANNEL);
     assert_eq!(decoded.pcm.len(), STEREO_SAMPLES_PER_BLOCK);
 }
 
@@ -844,9 +1299,9 @@ fn opus_encoder_writes_to_caller_buffer() {
     let mut encoder = PacketEncoder::new(EncodeConfig::default()).unwrap();
     let mut output = Vec::with_capacity(MAX_PACKET_BYTES);
 
-    let duration = encoder.encode_into(&frame, &mut output).unwrap();
+    let written = encoder.encode_into(&frame, &mut output).unwrap();
 
-    assert_eq!(duration, Duration::from_millis(20));
+    assert_eq!(written, output.len());
     assert!(!output.is_empty());
     assert!(output.len() <= MAX_PACKET_BYTES);
     assert!(output.capacity() >= MAX_PACKET_BYTES);
@@ -868,7 +1323,7 @@ fn opus_streaming_encoder_resamples_and_pads_final_packet() {
     assert_eq!(encoder.push(&input, &mut packets).unwrap(), 0);
     assert_eq!(encoder.finish(&mut packets).unwrap(), 1);
     assert!(encoder.resampling_required());
-    assert_eq!(packets[0].duration, Duration::from_millis(20));
+    assert_eq!(packets[0].duration(), Duration::from_millis(20));
 }
 
 #[test]
@@ -954,9 +1409,9 @@ fn opus_decoder_accepts_mono_discord_speech_frames() {
         .decode_frame(test_received_frame(opus[..written].to_vec()))
         .unwrap();
 
-    assert_eq!(decoded.sample_rate, SAMPLE_RATE_HZ);
-    assert_eq!(decoded.channels, CHANNELS);
-    assert_eq!(decoded.samples_per_channel, SAMPLES_PER_CHANNEL);
+    assert_eq!(decoded.pcm_layout.sample_rate_hz, SAMPLE_RATE_HZ);
+    assert_eq!(decoded.pcm_layout.channels, CHANNELS);
+    assert_eq!(decoded.pcm_layout.samples_per_channel, SAMPLES_PER_CHANNEL);
     assert_eq!(decoded.pcm.len(), STEREO_SAMPLES_PER_BLOCK);
     for frame in decoded.pcm.chunks_exact(CHANNELS) {
         assert_eq!(frame[0], frame[1]);
@@ -1058,7 +1513,7 @@ fn test_pending_media(ssrc: u32, seq: u16) -> PendingMediaPacket<NoRawPackets> {
             padding: false,
             extension: false,
             marker: false,
-            payload_type: RTP_PAYLOAD_TYPE,
+            payload_type: test_opus_payload_type(),
             seq,
             timestamp: u32::from(seq) * SAMPLES_PER_CHANNEL as u32,
             ssrc,
@@ -1066,8 +1521,37 @@ fn test_pending_media(ssrc: u32, seq: u16) -> PendingMediaPacket<NoRawPackets> {
             encrypted_body_offset: 12,
         },
         user_id: Some(TEST_DISCORD_ID),
-        codec: MediaCodec::Opus,
+        codec: Codec::Opus,
         encrypted_payload: vec![seq as u8],
+        dave: false,
+    }
+}
+
+fn test_pending_video_media(
+    ssrc: u32,
+    seq: u16,
+    timestamp: u32,
+    codec: Codec,
+    marker: bool,
+    encrypted_payload: Vec<u8>,
+) -> PendingMediaPacket<NoRawPackets> {
+    PendingMediaPacket {
+        raw: (),
+        rtp: RtpHeader {
+            version: RTP_VERSION,
+            padding: false,
+            extension: false,
+            marker,
+            payload_type: codecs::payload_type(codec),
+            seq,
+            timestamp,
+            ssrc,
+            header_len: 12,
+            encrypted_body_offset: 12,
+        },
+        user_id: Some(TEST_DISCORD_ID),
+        codec,
+        encrypted_payload,
         dave: false,
     }
 }
@@ -1084,7 +1568,7 @@ fn test_pending_raw_media(
             padding: false,
             extension: false,
             marker: false,
-            payload_type: RTP_PAYLOAD_TYPE,
+            payload_type: test_opus_payload_type(),
             seq,
             timestamp: u32::from(seq) * SAMPLES_PER_CHANNEL as u32,
             ssrc,
@@ -1092,7 +1576,7 @@ fn test_pending_raw_media(
             encrypted_body_offset: 12,
         },
         user_id: Some(TEST_DISCORD_ID),
-        codec: MediaCodec::Opus,
+        codec: Codec::Opus,
         encrypted_payload: vec![seq as u8],
         dave: false,
     }
@@ -1105,10 +1589,10 @@ fn test_received_frame(frame: Vec<u8>) -> ReceivedFrame {
 fn test_received_frame_with_seq(seq: u16, frame: Vec<u8>) -> ReceivedFrame {
     ReceivedFrame {
         raw: NoRawPackets,
-        rtp: test_rtp_header_with_seq(seq, RTP_PAYLOAD_TYPE),
+        rtp: test_rtp_header_with_seq(seq, test_opus_payload_type()),
         user_id: Some(1),
         media_type: MediaType::Audio,
-        codec: MediaCodec::Opus,
+        codec: Codec::Opus,
         frame,
     }
 }
@@ -1120,13 +1604,13 @@ fn test_received_frame_with_ssrc(ssrc: u32, seq: u16) -> ReceivedFrame {
 }
 
 fn test_pending_frame(ssrc: u32, seq: u16) -> PendingMediaFrame<NoRawPackets> {
-    let mut rtp = test_rtp_header_with_seq(seq, RTP_PAYLOAD_TYPE);
+    let mut rtp = test_rtp_header_with_seq(seq, test_opus_payload_type());
     rtp.ssrc = ssrc;
     PendingMediaFrame {
         raw: NoRawPackets,
         rtp,
         user_id: Some(TEST_DISCORD_ID),
-        codec: MediaCodec::Opus,
+        codec: Codec::Opus,
         encrypted_frame: vec![seq as u8],
         dave: true,
         enqueued_at: Instant::now(),
@@ -1147,11 +1631,11 @@ fn test_pending_frame_enqueued(
     frame
 }
 
-fn test_rtp_header(payload_type: u8) -> RtpHeader {
+fn test_rtp_header(payload_type: RtpPayloadType) -> RtpHeader {
     test_rtp_header_with_seq(0, payload_type)
 }
 
-fn test_rtp_header_with_seq(seq: u16, payload_type: u8) -> RtpHeader {
+fn test_rtp_header_with_seq(seq: u16, payload_type: RtpPayloadType) -> RtpHeader {
     RtpHeader {
         version: RTP_VERSION,
         padding: false,
@@ -1177,7 +1661,7 @@ impl TestEncryptedRtpPacket {
         nonce_suffix: [u8; 4],
         opus: &[u8],
     ) -> Self {
-        let mut bytes = build_rtp_header(10, 20, 30, RTP_PAYLOAD_TYPE);
+        let mut bytes = build_rtp_header(10, 20, 30, test_opus_payload_type());
         bytes[0] |= 0x10;
         bytes.extend_from_slice(&[0xbe, 0xde, 0x00, 0x01]);
 
@@ -1214,7 +1698,7 @@ impl TestEncryptedRtpPacket {
         nonce_suffix: [u8; 4],
         opus: &[u8],
     ) -> Self {
-        let mut bytes = build_rtp_header(10, 20, 30, RTP_PAYLOAD_TYPE);
+        let mut bytes = build_rtp_header(10, 20, 30, test_opus_payload_type());
         bytes[0] |= 0x20;
 
         let aad = bytes.clone();
@@ -1263,10 +1747,8 @@ fn assert_dave_gateway_payload_too_short(error: Error, expected_opcode: u8, expe
 #[test]
 fn clients_connect_tracks_connected_user_roster() {
     let mut state_tx = test_state_store();
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    handle_voice_text_event(
+    handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::ClientsConnect.code(),
@@ -1274,9 +1756,6 @@ fn clients_connect_tracks_connected_user_roster() {
             data: serde_json::from_str(&format!(r#"{{"user_ids":["{TEST_DISCORD_ID_JSON}"]}}"#))
                 .unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
@@ -1292,10 +1771,8 @@ fn clients_connect_tracks_connected_user_roster() {
 #[test]
 fn client_connect_maps_audio_ssrc_to_user() {
     let mut state_tx = test_state_store();
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    handle_voice_text_event(
+    handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::ClientConnect.code(),
@@ -1305,9 +1782,6 @@ fn client_connect_maps_audio_ssrc_to_user() {
             ))
             .unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
@@ -1332,10 +1806,8 @@ fn client_disconnect_removes_user_from_media_roster_and_ssrcs() {
         state.ssrc_users_mut().insert(456, 1);
         state
     });
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    handle_voice_text_event(
+    handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::ClientDisconnect.code(),
@@ -1343,9 +1815,6 @@ fn client_disconnect_removes_user_from_media_roster_and_ssrcs() {
             data: serde_json::from_str(&format!(r#"{{"user_id":"{TEST_DISCORD_ID_JSON}"}}"#))
                 .unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
@@ -1360,31 +1829,26 @@ fn client_disconnect_removes_user_from_media_roster_and_ssrcs() {
 }
 
 #[test]
-fn dave_execute_transition_from_transport_requests_receive_passthrough_window() {
+fn dave_execute_transition_from_transport_requests_plaintext_receive_grace() {
     let mut state_tx = ConnectionStateStore::new({
         let mut state = test_state();
         state.dave.prepare_transition(7, 1);
         state
     });
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    let effects = handle_voice_text_event(
+    let effects = handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::DaveExecuteTransition.code(),
             seq: None,
             data: serde_json::from_str(r#"{"transition_id":7}"#).unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
-    assert!(effects.allow_transition_receive_passthrough);
+    assert!(effects.allow_plaintext_receive_grace);
     assert_eq!(
-        state_tx.internal().dave.active_receive_protocol_version,
+        state_tx.internal().dave.active_receive_protocol_version(),
         Some(1)
     );
 }
@@ -1393,29 +1857,25 @@ fn dave_execute_transition_from_transport_requests_receive_passthrough_window() 
 fn dave_execute_transition_between_dave_protocols_does_not_request_plain_passthrough() {
     let mut state_tx = ConnectionStateStore::new({
         let mut state = test_state();
-        state.dave.active_receive_protocol_version = Some(1);
+        state.dave.prepare_transition(6, 1);
+        state.dave.execute_transition(6);
         state.dave.prepare_transition(7, 1);
         state
     });
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    let effects = handle_voice_text_event(
+    let effects = handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::DaveExecuteTransition.code(),
             seq: None,
             data: serde_json::from_str(r#"{"transition_id":7}"#).unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
-    assert!(!effects.allow_transition_receive_passthrough);
+    assert!(!effects.allow_plaintext_receive_grace);
     assert_eq!(
-        state_tx.internal().dave.active_receive_protocol_version,
+        state_tx.internal().dave.active_receive_protocol_version(),
         Some(1)
     );
 }
@@ -1549,7 +2009,7 @@ fn dave_binary_parser_rejects_opcode_first_server_frames() {
 fn dave_binary_parser_accepts_seq_prefixed_server_frames() {
     let bytes = [0, 7, Opcode::DaveMlsExternalSender.byte(), 0xde, 0xad];
     let event = BinaryEvent::parse(&bytes).unwrap();
-    assert_eq!(event.seq, Some(7));
+    assert_eq!(event.seq, 7);
     assert_eq!(event.opcode, Opcode::DaveMlsExternalSender);
     assert_eq!(event.payload, &[0xde, 0xad]);
 }
@@ -1585,76 +2045,102 @@ fn short_dave_welcome_payload_errors() {
 }
 
 #[test]
+fn dave_commit_transition_payload_stores_message_identity() {
+    let mut state_tx = test_state_store();
+
+    handle_voice_binary_event(
+        &mut state_tx,
+        &[
+            0,
+            7,
+            Opcode::DaveMlsAnnounceCommitTransition.byte(),
+            0,
+            8,
+            0xad,
+        ],
+    )
+    .unwrap();
+
+    let state = state_tx.internal();
+    let commit = state.dave.pending_mls.commit().unwrap();
+    assert_eq!(state.last_seq, Some(7));
+    assert_eq!(commit.payload, [0xad]);
+    assert_eq!(commit.identity.kind, DaveMlsMessageKind::Commit);
+    assert_eq!(commit.identity.seq, 7);
+    assert_eq!(commit.identity.transition_id, 8);
+}
+
+#[test]
 fn dave_prepare_epoch_resets_epoch_without_transition_id() {
     let mut state_tx = ConnectionStateStore::new({
         let mut state = test_state();
-        state.dave.transition_id = Some(8);
-        state.dave.epoch = Some(2);
+        state.dave.prepare_transition(8, 1);
+        state.dave.prepare_epoch(1, 2);
         state.dave.proposals.push(vec![0xde]);
-        state.dave.pending_commit = Some(vec![0xad]);
-        state.dave.pending_welcome = Some(vec![0xbe]);
+        state
+            .dave
+            .pending_mls
+            .set_message(test_pending_mls(DaveMlsMessageKind::Commit));
+        state
+            .dave
+            .pending_mls
+            .set_message(test_pending_mls(DaveMlsMessageKind::Welcome));
         state
     });
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
-    handle_voice_text_event(
+    handle_test_voice_text_event(
         &mut state_tx,
         ParsedVoiceGatewayEvent {
             opcode: Opcode::DavePrepareEpoch.code(),
             seq: Some(11),
             data: serde_json::from_str(r#"{"protocol_version":1,"epoch":1}"#).unwrap(),
         },
-        &mut ack_pending,
-        &mut heartbeat_sent_at,
-        &NoopConnectionObserver,
     )
     .unwrap();
 
     let state = state_tx.internal();
-    assert_eq!(state.dave.protocol_version, Some(1));
-    assert_eq!(state.dave.transition_id, Some(8));
-    assert_eq!(state.dave.epoch, Some(1));
-    assert_eq!(state.dave.prepare_epoch_seq, 1);
+    assert_eq!(state.dave.protocol_version(), Some(1));
+    assert_eq!(state.dave.transition_id(), Some(8));
+    assert_eq!(state.dave.epoch(), Some(1));
+    assert_eq!(state.dave.prepare_epoch_seq(), 2);
     assert!(state.dave.proposals.is_empty());
-    assert!(state.dave.pending_commit.is_none());
-    assert!(state.dave.pending_welcome.is_none());
+    assert!(state.dave.pending_mls.is_empty());
 }
 
 #[test]
 fn dave_repeated_prepare_epoch_events_remain_distinct() {
     let mut state_tx = test_state_store();
-    let mut ack_pending = false;
-    let mut heartbeat_sent_at = None;
 
     for seq in [11, 12] {
-        update_state(&mut state_tx, |state| {
+        state_tx.update(|state| {
             state.dave.proposals.push(vec![0xde]);
-            state.dave.pending_commit = Some(vec![0xad]);
-            state.dave.pending_welcome = Some(vec![0xbe]);
+            state
+                .dave
+                .pending_mls
+                .set_message(test_pending_mls(DaveMlsMessageKind::Commit));
+            state
+                .dave
+                .pending_mls
+                .set_message(test_pending_mls(DaveMlsMessageKind::Welcome));
         });
 
-        handle_voice_text_event(
+        handle_test_voice_text_event(
             &mut state_tx,
             ParsedVoiceGatewayEvent {
                 opcode: Opcode::DavePrepareEpoch.code(),
                 seq: Some(seq),
                 data: serde_json::from_str(r#"{"protocol_version":1,"epoch":1}"#).unwrap(),
             },
-            &mut ack_pending,
-            &mut heartbeat_sent_at,
-            &NoopConnectionObserver,
         )
         .unwrap();
     }
 
     let state = state_tx.internal();
-    assert_eq!(state.dave.protocol_version, Some(1));
-    assert_eq!(state.dave.epoch, Some(1));
-    assert_eq!(state.dave.prepare_epoch_seq, 2);
+    assert_eq!(state.dave.protocol_version(), Some(1));
+    assert_eq!(state.dave.epoch(), Some(1));
+    assert_eq!(state.dave.prepare_epoch_seq(), 2);
     assert!(state.dave.proposals.is_empty());
-    assert!(state.dave.pending_commit.is_none());
-    assert!(state.dave.pending_welcome.is_none());
+    assert!(state.dave.pending_mls.is_empty());
 }
 
 #[test]
@@ -1663,9 +2149,9 @@ fn dave_initial_transition_zero_stays_pending_without_epoch_reset() {
 
     state.prepare_transition(0, 1);
 
-    assert_eq!(state.transition_id, Some(0));
-    assert_eq!(state.epoch, None);
-    assert_eq!(state.protocol_version, Some(1));
+    assert_eq!(state.transition_id(), Some(0));
+    assert_eq!(state.epoch(), None);
+    assert_eq!(state.protocol_version(), Some(1));
 }
 
 #[test]
@@ -1673,17 +2159,20 @@ fn dave_sole_member_reset_transition_zero_executes_immediately() {
     let mut state = DaveInternalState::default();
     state.prepare_epoch(1, 1);
     state.proposals.push(vec![0xde]);
-    state.pending_commit = Some(vec![0xad]);
-    state.pending_welcome = Some(vec![0xbe]);
+    state
+        .pending_mls
+        .set_message(test_pending_mls(DaveMlsMessageKind::Commit));
+    state
+        .pending_mls
+        .set_message(test_pending_mls(DaveMlsMessageKind::Welcome));
 
     state.prepare_transition(0, 1);
 
-    assert_eq!(state.transition_id, None);
-    assert_eq!(state.epoch, Some(1));
-    assert_eq!(state.protocol_version, Some(1));
+    assert_eq!(state.transition_id(), None);
+    assert_eq!(state.epoch(), Some(1));
+    assert_eq!(state.protocol_version(), Some(1));
     assert!(state.proposals.is_empty());
-    assert!(state.pending_commit.is_none());
-    assert!(state.pending_welcome.is_none());
+    assert!(state.pending_mls.is_empty());
 }
 
 #[test]
@@ -1691,36 +2180,51 @@ fn dave_transition_zero_media_ready_requires_local_ready_ack() {
     let mut state = DaveInternalState::default();
     state.prepare_transition(0, 1);
 
-    assert!(!dave_transition_zero_media_ready(&state, None));
-    assert!(dave_transition_zero_media_ready(&state, Some(0)));
-    assert!(!dave_transition_zero_media_ready(&state, Some(1)));
+    assert!(!state.transition_zero_media_ready(None));
+    assert!(state.transition_zero_media_ready(Some(0)));
+    assert!(!state.transition_zero_media_ready(Some(1)));
+
+    state.proposals.push(vec![0xde]);
+    assert!(state.transition_zero_media_ready(Some(0)));
+    state.proposals.clear();
+
+    state
+        .pending_mls
+        .set_message(test_pending_mls(DaveMlsMessageKind::Welcome));
+    assert!(state.transition_zero_media_ready(Some(0)));
 }
 
 #[test]
 fn dave_send_media_ready_does_not_depend_on_consumed_transition_ack() {
-    assert!(dave_send_media_ready(false, false, false, false));
-    assert!(!dave_send_media_ready(true, false, true, true));
-    assert!(!dave_send_media_ready(true, true, false, true));
-    assert!(!dave_send_media_ready(true, true, true, false));
-    assert!(dave_send_media_ready(true, true, true, true));
+    assert!(DaveMediaStatus::ready_from(false, false, false, false));
+    assert!(!DaveMediaStatus::ready_from(true, false, true, true));
+    assert!(!DaveMediaStatus::ready_from(true, true, false, true));
+    assert!(!DaveMediaStatus::ready_from(true, true, true, false));
+    assert!(DaveMediaStatus::ready_from(true, true, true, true));
 }
 
 #[test]
 fn dave_receive_transform_is_only_active_for_dave_media() {
-    let mut state = DaveInternalState {
-        passthrough: true,
-        ..DaveInternalState::default()
-    };
-    assert!(!dave_receive_transform_active(&state));
+    let mut state = DaveInternalState::default();
+    assert!(!state.receive_transform_active());
 
-    state.protocol_version = Some(1);
-    assert!(!dave_receive_transform_active(&state));
+    state.set_session_protocol(Some(1));
+    assert!(state.receive_transform_active());
 
-    state.active_receive_protocol_version = Some(1);
-    assert!(dave_receive_transform_active(&state));
+    state.prepare_transition(0, 1);
+    assert!(state.receive_transform_active());
 
-    state.active_receive_protocol_version = Some(0);
-    assert!(!dave_receive_transform_active(&state));
+    let mut state = DaveInternalState::default();
+    state.set_session_protocol(Some(1));
+    state.prepare_transition(7, 1);
+    assert!(state.receive_transform_active());
+
+    state.execute_transition(7);
+    assert!(state.receive_transform_active());
+
+    state.prepare_transition(8, 0);
+    state.execute_transition(8);
+    assert!(!state.receive_transform_active());
 }
 
 #[test]
@@ -1728,39 +2232,89 @@ fn dave_active_send_protocol_switches_only_on_execute() {
     let mut state = DaveInternalState::default();
 
     state.set_session_protocol(Some(1));
-    assert_eq!(state.protocol_version, Some(1));
-    assert_eq!(state.active_send_protocol_version, None);
-    assert_eq!(state.active_receive_protocol_version, None);
+    assert_eq!(state.protocol_version(), Some(1));
+    assert!(state.send_requires_dave());
+    assert_eq!(state.active_send_protocol_version(), None);
+    assert_eq!(state.active_receive_protocol_version(), None);
 
     state.prepare_transition(7, 1);
-    assert_eq!(state.protocol_version, Some(1));
-    assert_eq!(state.active_send_protocol_version, None);
-    assert_eq!(state.active_receive_protocol_version, None);
+    assert_eq!(state.protocol_version(), Some(1));
+    assert!(state.send_requires_dave());
+    assert_eq!(state.active_send_protocol_version(), None);
+    assert_eq!(state.active_receive_protocol_version(), None);
 
     state.execute_transition(7);
-    assert_eq!(state.protocol_version, Some(1));
-    assert_eq!(state.active_send_protocol_version, Some(1));
-    assert_eq!(state.active_receive_protocol_version, Some(1));
+    assert_eq!(state.protocol_version(), Some(1));
+    assert_eq!(state.active_send_protocol_version(), Some(1));
+    assert_eq!(state.active_receive_protocol_version(), Some(1));
 
     state.set_session_protocol(Some(1));
-    assert_eq!(state.protocol_version, Some(1));
-    assert_eq!(state.active_send_protocol_version, Some(1));
-    assert_eq!(state.active_receive_protocol_version, Some(1));
+    assert_eq!(state.protocol_version(), Some(1));
+    assert_eq!(state.active_send_protocol_version(), Some(1));
+    assert_eq!(state.active_receive_protocol_version(), Some(1));
 
     state.prepare_transition(7, 0);
-    assert_eq!(state.protocol_version, Some(0));
-    assert_eq!(state.active_send_protocol_version, Some(1));
-    assert_eq!(state.active_receive_protocol_version, Some(1));
+    assert_eq!(state.protocol_version(), Some(0));
+    assert_eq!(state.active_send_protocol_version(), Some(1));
+    assert_eq!(state.active_receive_protocol_version(), Some(1));
 
     state.execute_transition(7);
-    assert_eq!(state.protocol_version, Some(0));
-    assert_eq!(state.active_send_protocol_version, Some(0));
-    assert_eq!(state.active_receive_protocol_version, Some(0));
+    assert_eq!(state.protocol_version(), Some(0));
+    assert_eq!(state.active_send_protocol_version(), Some(0));
+    assert_eq!(state.active_receive_protocol_version(), Some(0));
 
     state.set_session_protocol(None);
-    assert_eq!(state.protocol_version, None);
-    assert_eq!(state.active_send_protocol_version, None);
-    assert_eq!(state.active_receive_protocol_version, None);
+    assert_eq!(state.protocol_version(), None);
+    assert_eq!(state.active_send_protocol_version(), None);
+    assert_eq!(state.active_receive_protocol_version(), None);
+}
+
+#[test]
+fn dave_transport_to_dave_transition_waits_until_execute() {
+    let mut state = DaveInternalState::default();
+
+    state.set_session_protocol(Some(0));
+    state.prepare_transition(7, 1);
+
+    assert_eq!(state.protocol_version(), Some(1));
+    assert!(!state.send_requires_dave());
+    assert!(!state.receive_transform_active());
+    assert_eq!(state.active_send_protocol_version(), Some(0));
+    assert_eq!(state.active_receive_protocol_version(), Some(0));
+
+    state.execute_transition(7);
+
+    assert!(state.send_requires_dave());
+    assert!(state.receive_transform_active());
+    assert_eq!(state.active_send_protocol_version(), Some(1));
+    assert_eq!(state.active_receive_protocol_version(), Some(1));
+}
+
+#[test]
+fn dave_transition_zero_uses_dave_media_before_execute() {
+    let mut state = DaveInternalState::default();
+
+    state.prepare_transition(0, 1);
+
+    assert_eq!(state.protocol_version(), Some(1));
+    assert!(state.send_requires_dave());
+    assert!(state.receive_transform_active());
+    assert_eq!(state.active_send_protocol_version(), None);
+    assert_eq!(state.active_receive_protocol_version(), None);
+}
+
+#[test]
+fn dave_default_identity_is_shared_for_active_user_sessions() {
+    let identity = DaveIdentityKey::shared_ephemeral(1);
+    let other_connection = DaveIdentityKey::shared_ephemeral(1);
+    let other_user = DaveIdentityKey::shared_ephemeral(2);
+
+    assert_eq!(identity, other_connection);
+    assert_ne!(identity, other_user);
+    assert_eq!(
+        identity.persistence(),
+        dave::IdentityKeyPersistence::Ephemeral
+    );
 }
 
 #[test]
@@ -1778,47 +2332,29 @@ fn receive_interarrival_stats_use_bounded_sorted_window() {
 
 #[test]
 fn dave_no_valid_cryptor_retries_only_while_state_can_still_change() {
-    assert!(!dave_decrypt_failure_should_retry(
-        ReceiveDecodeErrorKind::DaveNoValidCryptor,
-        false
-    ));
-    assert!(dave_decrypt_failure_should_retry(
-        ReceiveDecodeErrorKind::DaveNoValidCryptor,
-        true
-    ));
-    assert!(!dave_decrypt_failure_should_retry(
-        ReceiveDecodeErrorKind::DaveNoDecryptorForUser,
-        false
-    ));
-    assert!(dave_decrypt_failure_should_retry(
-        ReceiveDecodeErrorKind::DaveNoDecryptorForUser,
-        true
-    ));
-    assert!(!dave_decrypt_failure_should_retry(
-        ReceiveDecodeErrorKind::DaveUnencryptedWhenPassthroughDisabled,
-        true
-    ));
+    assert!(!ReceiveDecodeErrorKind::DaveNoValidCryptor.should_retry_dave_decrypt(false));
+    assert!(ReceiveDecodeErrorKind::DaveNoValidCryptor.should_retry_dave_decrypt(true));
+    assert!(!ReceiveDecodeErrorKind::DaveNoDecryptorForUser.should_retry_dave_decrypt(false));
+    assert!(ReceiveDecodeErrorKind::DaveNoDecryptorForUser.should_retry_dave_decrypt(true));
+    assert!(
+        !ReceiveDecodeErrorKind::DaveUnencryptedWhenPassthroughDisabled
+            .should_retry_dave_decrypt(true)
+    );
 }
 
 #[test]
 fn dave_prepared_epoch_scope_includes_prepare_event_seq() {
-    let mut first = DaveInternalState {
-        protocol_version: Some(1),
-        epoch: Some(1),
-        prepare_epoch_seq: 1,
-        ..DaveInternalState::default()
-    };
-    let second = DaveInternalState {
-        prepare_epoch_seq: 2,
-        ..first.clone()
-    };
+    let mut first = DaveInternalState::default();
+    first.prepare_epoch(1, 1);
+    let mut second = first.clone();
+    second.prepare_epoch(1, 1);
 
     assert_ne!(
         DavePreparedEpoch::from_state(&first),
         DavePreparedEpoch::from_state(&second)
     );
 
-    first.prepare_epoch_seq = 2;
+    first.prepare_epoch(1, 1);
     assert_eq!(
         DavePreparedEpoch::from_state(&first),
         DavePreparedEpoch::from_state(&second)
@@ -1830,6 +2366,6 @@ fn state_updates_do_not_require_subscribers() {
     let mut state_tx = test_state_store();
     let state_rx = state_tx.subscribe_public();
     drop(state_rx);
-    update_state(&mut state_tx, |state| state.resumed = true);
+    state_tx.update(|state| state.resumed = true);
     assert!(state_tx.internal().resumed);
 }

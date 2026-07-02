@@ -1,8 +1,8 @@
 use std::{
+    collections::VecDeque,
     fmt,
-    marker::PhantomData,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use aes_gcm::{
@@ -10,26 +10,27 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
 };
 use chacha20poly1305::{Tag as XTag, XChaCha20Poly1305, XNonce};
-use dave::MediaType;
+use dave::{Codec, MediaType};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{
     net::{TcpStream, UdpSocket},
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{client_async_tls_with_config, tungstenite::client::IntoClientRequest};
-use zeroize::Zeroizing;
 
 use crate::{
-    AEAD_TAG_LEN, GatewayWebSocketConnectResult, JS_MAX_SAFE_INTEGER, RTP_VERSION,
-    RTPSIZE_NONCE_LEN, WEBSOCKET_ADDRESS_CONNECT_TIMEOUT, WEBSOCKET_ADDRESS_STAGGER,
-    connection::ConnectionStateStore,
+    AEAD_TAG_LEN, GatewayWebSocketConnectResult, RTP_VERSION, RTPSIZE_NONCE_LEN,
+    WEBSOCKET_ADDRESS_CONNECT_TIMEOUT, WEBSOCKET_ADDRESS_STAGGER,
+    codecs::{self, DiscordCodecDescriptor},
     errors::{
-        Error, InvalidInputError, ProtocolError, Result, RtpError, TransportCryptoDirection,
-        TransportCryptoError, UnsupportedCodecError,
+        Error, InvalidInputError, PayloadKind, ProtocolError, Result, RtpError,
+        TransportCryptoError,
     },
-    gateway::GatewayReady,
-    observer::RtcpHeader,
-    state::{ConnectionInternalState, ConnectionOptions, EncryptionMode, SessionDescription},
+    observer::{DavePendingMediaReason, RtcpHeader},
+    rtp::RtpPayloadType,
+    rtp_payload::ParsedRtpPayload,
+    secrets::RedactedSecret,
+    state::{EncryptionMode, PendingMediaFrame, PendingMediaPacket},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,13 +56,25 @@ impl RawUdpPacket {
     pub fn rtcp_header(&self) -> Option<RtcpHeader> {
         self.info.rtcp_header(&self.bytes)
     }
+
+    pub(crate) fn ensure_len_at_most(self, max_len: usize, kind: PayloadKind) -> Result<Self> {
+        if self.bytes.len() > max_len {
+            Err(Error::PayloadTooLarge {
+                kind,
+                len: self.bytes.len(),
+                max_len,
+            })
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawUdpPacketInfo {
     pub version: Option<u8>,
     pub raw_payload_type: Option<u8>,
-    pub payload_type: Option<u8>,
+    pub payload_type: Option<RtpPayloadType>,
     pub seq: Option<u16>,
     pub timestamp: Option<u32>,
     pub ssrc: Option<u32>,
@@ -83,7 +96,7 @@ impl RawUdpPacketInfo {
             Self {
                 version: None,
                 raw_payload_type,
-                payload_type: raw_payload_type.map(|byte| byte & 0x7f),
+                payload_type: raw_payload_type.map(RtpPayloadType::from_marker_byte),
                 seq: None,
                 timestamp: None,
                 ssrc: None,
@@ -120,9 +133,7 @@ pub trait FrameRaw: Send + Sync + 'static {
     type Packet: Send + Sync + 'static;
 
     fn capture_packet(bytes: &[u8], info: RawUdpPacketInfo) -> Self::Packet;
-    fn from_rtp_packet<C>(packet: Self::Packet) -> Self
-    where
-        C: RtpPayloadCodec;
+    fn from_rtp_packets(packets: Vec<Self::Packet>) -> Self;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,10 +144,7 @@ impl FrameRaw for NoRawPackets {
 
     fn capture_packet(_bytes: &[u8], _info: RawUdpPacketInfo) -> Self::Packet {}
 
-    fn from_rtp_packet<C>(_packet: Self::Packet) -> Self
-    where
-        C: RtpPayloadCodec,
-    {
+    fn from_rtp_packets(_packets: Vec<Self::Packet>) -> Self {
         Self
     }
 }
@@ -153,34 +161,174 @@ impl FrameRaw for RawFramePackets {
         info.into_raw_packet(bytes)
     }
 
-    fn from_rtp_packet<C>(packet: Self::Packet) -> Self
-    where
-        C: RtpPayloadCodec,
-    {
+    fn from_rtp_packets(packets: Vec<Self::Packet>) -> Self {
+        Self { packets }
+    }
+}
+
+pub(crate) struct RtpFrameAssembler<Raw>
+where
+    Raw: FrameRaw,
+{
+    partial: Option<PartialRtpFrame<Raw>>,
+    completed: VecDeque<PendingMediaFrame<Raw>>,
+}
+
+impl<Raw> Default for RtpFrameAssembler<Raw>
+where
+    Raw: FrameRaw,
+{
+    fn default() -> Self {
         Self {
-            packets: vec![packet],
+            partial: None,
+            completed: VecDeque::new(),
         }
     }
 }
 
-pub trait RtpPayloadCodec: Copy + Send + Sync + 'static {
-    const CODEC: MediaCodec;
-    const DISCORD_PAYLOAD_TYPE: u8;
-    const SAMPLE_RATE_HZ: u32;
+pub(crate) struct PartialRtpFrame<Raw>
+where
+    Raw: FrameRaw,
+{
+    raw_packets: Vec<Raw::Packet>,
+    rtp: RtpHeader,
+    user_id: Option<u64>,
+    codec: Codec,
+    encrypted_frame: Vec<u8>,
+    dave: bool,
+    last_seq: u16,
 }
 
-pub trait EncryptedMediaCodec: RtpPayloadCodec {
-    type DaveCodec: dave::FrameCodec;
+impl<Raw> PartialRtpFrame<Raw>
+where
+    Raw: FrameRaw,
+{
+    fn new(packet: &PendingMediaPacket<Raw>) -> Self {
+        Self {
+            raw_packets: Vec::new(),
+            rtp: packet.rtp.clone(),
+            user_id: packet.user_id,
+            codec: packet.codec,
+            encrypted_frame: Vec::new(),
+            dave: packet.dave,
+            last_seq: packet.rtp.seq,
+        }
+    }
+
+    fn matches_context(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.rtp.ssrc == packet.rtp.ssrc && self.codec == packet.codec && self.dave == packet.dave
+    }
+
+    fn accepts_next(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.matches_context(packet) && packet.rtp.seq == self.last_seq.wrapping_add(1)
+    }
+
+    fn should_complete_before(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.codec == Codec::Av1
+            && self.matches_context(packet)
+            && self.rtp.timestamp != packet.rtp.timestamp
+    }
+
+    fn append_payload(&mut self, seq: u16, payload: ParsedRtpPayload<'_>) -> Result<()> {
+        payload.append_depacketized(&mut self.encrypted_frame)?;
+        self.last_seq = seq;
+        Ok(())
+    }
+
+    fn push_raw_packet(&mut self, packet: Raw::Packet) {
+        self.raw_packets.push(packet);
+    }
+
+    fn into_pending(self) -> PendingMediaFrame<Raw> {
+        PendingMediaFrame {
+            raw: Raw::from_rtp_packets(self.raw_packets),
+            rtp: self.rtp,
+            user_id: self.user_id,
+            codec: self.codec,
+            encrypted_frame: self.encrypted_frame,
+            dave: self.dave,
+            enqueued_at: tokio::time::Instant::now(),
+            reason: DavePendingMediaReason::DecryptStatePending,
+            was_pending: false,
+        }
+    }
 }
 
-pub trait RtpPayload {
-    type Codec: RtpPayloadCodec;
+impl<Raw> RtpFrameAssembler<Raw>
+where
+    Raw: FrameRaw,
+{
+    pub(crate) fn push_packet(
+        &mut self,
+        packet: PendingMediaPacket<Raw>,
+    ) -> Result<Option<PendingMediaFrame<Raw>>> {
+        if self.partial_should_complete_before(&packet)
+            && let Some(partial) = self.partial.take()
+        {
+            self.completed.push_back(partial.into_pending());
+        }
 
-    fn bytes(&self) -> &[u8];
-    fn duration(&self) -> Duration;
-    fn into_bytes(self) -> Vec<u8>
-    where
-        Self: Sized;
+        let continues_partial = self.has_contiguous_partial(&packet);
+        if !continues_partial && self.has_matching_partial(&packet) {
+            self.partial = None;
+        }
+        let payload = ParsedRtpPayload::parse(
+            packet.codec,
+            &packet.encrypted_payload,
+            packet.rtp.marker,
+            continues_partial,
+        )?;
+        let boundary = payload.boundary();
+        if !continues_partial && !boundary.starts_frame {
+            return Ok(self.completed.pop_front());
+        }
+        let mut partial = if continues_partial && !boundary.starts_frame {
+            self.partial.take().expect("partial frame exists")
+        } else {
+            PartialRtpFrame::new(&packet)
+        };
+
+        partial.append_payload(packet.rtp.seq, payload)?;
+        partial.push_raw_packet(packet.raw);
+
+        if boundary.completes_frame {
+            self.completed.push_back(partial.into_pending());
+        } else {
+            self.partial = Some(partial);
+        }
+        Ok(self.completed.pop_front())
+    }
+
+    pub(crate) fn pop_completed(&mut self) -> Option<PendingMediaFrame<Raw>> {
+        self.completed.pop_front()
+    }
+
+    pub(crate) fn has_completed_frame(&self) -> bool {
+        !self.completed.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.partial = None;
+        self.completed.clear();
+    }
+
+    fn has_matching_partial(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.partial
+            .as_ref()
+            .is_some_and(|partial| partial.matches_context(packet))
+    }
+
+    fn has_contiguous_partial(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.partial
+            .as_ref()
+            .is_some_and(|partial| partial.accepts_next(packet))
+    }
+
+    fn partial_should_complete_before(&self, packet: &PendingMediaPacket<Raw>) -> bool {
+        self.partial
+            .as_ref()
+            .is_some_and(|partial| partial.should_complete_before(packet))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,12 +337,68 @@ pub struct RtpHeader {
     pub padding: bool,
     pub extension: bool,
     pub marker: bool,
-    pub payload_type: u8,
+    pub payload_type: RtpPayloadType,
     pub seq: u16,
     pub timestamp: u32,
     pub ssrc: u32,
     pub header_len: usize,
     pub encrypted_body_offset: usize,
+}
+
+impl RtpHeader {
+    pub fn parse(bytes: &[u8]) -> std::result::Result<Self, RtpError> {
+        let fixed =
+            RtpFixedHeader::parse(bytes).ok_or(RtpError::PacketTooShort { len: bytes.len() })?;
+        if fixed.version != RTP_VERSION {
+            return Err(RtpError::UnsupportedVersion {
+                version: fixed.version,
+            });
+        }
+
+        let csrc_count = usize::from(fixed.csrc_count);
+        let mut header_len = 12 + csrc_count * 4;
+        if bytes.len() < header_len {
+            return Err(RtpError::TruncatedCsrcList {
+                len: bytes.len(),
+                expected_header_len: header_len,
+            });
+        }
+
+        let mut encrypted_body_offset = header_len;
+        if fixed.extension {
+            if bytes.len() < header_len + 4 {
+                return Err(RtpError::TruncatedExtensionHeader {
+                    len: bytes.len(),
+                    expected_header_len: header_len + 4,
+                });
+            }
+            encrypted_body_offset += 4;
+            let extension_words = usize::from(u16::from_be_bytes([
+                bytes[header_len + 2],
+                bytes[header_len + 3],
+            ]));
+            header_len += 4 + extension_words * 4;
+            if bytes.len() < header_len {
+                return Err(RtpError::TruncatedExtensionPayload {
+                    len: bytes.len(),
+                    expected_header_len: header_len,
+                });
+            }
+        }
+
+        Ok(Self {
+            version: fixed.version,
+            padding: fixed.padding,
+            extension: fixed.extension,
+            marker: fixed.marker,
+            payload_type: fixed.payload_type,
+            seq: fixed.seq,
+            timestamp: fixed.timestamp,
+            ssrc: fixed.ssrc,
+            header_len,
+            encrypted_body_offset,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +407,7 @@ struct RtpFixedHeader {
     padding: bool,
     extension: bool,
     marker: bool,
-    payload_type: u8,
+    payload_type: RtpPayloadType,
     csrc_count: u8,
     seq: u16,
     timestamp: u32,
@@ -220,12 +424,62 @@ impl RtpFixedHeader {
             padding: bytes[0] & 0x20 != 0,
             extension: bytes[0] & 0x10 != 0,
             marker: bytes[1] & 0x80 != 0,
-            payload_type: bytes[1] & 0x7f,
+            payload_type: RtpPayloadType::from_marker_byte(bytes[1]),
             csrc_count: bytes[0] & 0x0f,
             seq: u16::from_be_bytes([bytes[2], bytes[3]]),
             timestamp: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             ssrc: u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RtpHeaderFields {
+    pub(crate) seq: u16,
+    pub(crate) timestamp: u32,
+    pub(crate) ssrc: u32,
+    pub(crate) payload_type: RtpPayloadType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RtpHeaderBuilder {
+    fields: RtpHeaderFields,
+    marker: bool,
+}
+
+impl RtpHeaderBuilder {
+    pub(crate) fn new(fields: RtpHeaderFields) -> Self {
+        Self {
+            fields,
+            marker: false,
+        }
+    }
+
+    pub(crate) fn marker(mut self, marker: bool) -> Self {
+        self.marker = marker;
+        self
+    }
+
+    pub(crate) fn write_to(self, packet: &mut Vec<u8>) -> RtpHeader {
+        packet.extend_from_slice(&[
+            RTP_VERSION << 6,
+            self.fields.payload_type.marker_byte(self.marker),
+        ]);
+        packet.extend_from_slice(&self.fields.seq.to_be_bytes());
+        packet.extend_from_slice(&self.fields.timestamp.to_be_bytes());
+        packet.extend_from_slice(&self.fields.ssrc.to_be_bytes());
+        RtpHeader {
+            version: RTP_VERSION,
+            padding: false,
+            extension: false,
+            marker: self.marker,
+            payload_type: self.fields.payload_type,
+            seq: self.fields.seq,
+            timestamp: self.fields.timestamp,
+            ssrc: self.fields.ssrc,
+            header_len: 12,
+            encrypted_body_offset: 12,
+        }
     }
 }
 
@@ -238,8 +492,25 @@ where
     pub rtp: RtpHeader,
     pub user_id: Option<u64>,
     pub media_type: MediaType,
-    pub codec: MediaCodec,
+    pub codec: Codec,
     pub frame: Vec<u8>,
+}
+
+impl<Raw> ReceivedFrame<Raw>
+where
+    Raw: FrameRaw,
+{
+    pub(crate) fn ensure_len_at_most(self, max_len: usize) -> Result<Self> {
+        if self.frame.len() > max_len {
+            Err(Error::PayloadTooLarge {
+                kind: PayloadKind::Frame,
+                len: self.frame.len(),
+                max_len,
+            })
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,35 +519,8 @@ where
     Raw: FrameRaw,
 {
     pub frame: ReceivedFrame<Raw>,
-    pub sample_rate: u32,
-    pub channels: usize,
-    pub samples_per_channel: usize,
+    pub pcm_layout: DecodedPcmLayout,
     pub pcm: Vec<i16>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MediaCodec {
-    Opus,
-}
-
-impl MediaCodec {
-    pub fn from_discord_audio_name(name: &str) -> Option<Self> {
-        name.eq_ignore_ascii_case("opus").then_some(Self::Opus)
-    }
-
-    pub(crate) fn default_discord_payload_type(self) -> u8 {
-        match self {
-            Self::Opus => crate::opus::discord::RTP_PAYLOAD_TYPE,
-        }
-    }
-}
-
-impl fmt::Display for MediaCodec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Opus => f.write_str("Opus"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,7 +529,12 @@ where
     Raw: FrameRaw,
 {
     pub frame: ReceivedFrame<Raw>,
-    pub sample_rate: u32,
+    pub pcm_layout: DecodedPcmLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedPcmLayout {
+    pub sample_rate_hz: u32,
     pub channels: usize,
     pub samples_per_channel: usize,
 }
@@ -293,75 +542,140 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboundPacket {
     pub rtp: RtpHeader,
-    pub nonce_suffix: [u8; 4],
+    pub nonce_suffix: RtpSizeNonceSuffix,
     pub payload_bytes: usize,
     pub packet_bytes: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OutboundRtpState<C>
-where
-    C: RtpPayloadCodec,
-{
-    seq: u16,
-    timestamp: u32,
-    nonce_suffix: u32,
-    ssrc: u32,
-    payload_type: u8,
-    sample_rate: u32,
-    _codec: PhantomData<C>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtpSizeNonceSuffix(u32);
+
+impl RtpSizeNonceSuffix {
+    pub const fn from_be_bytes(bytes: [u8; 4]) -> Self {
+        Self(u32::from_be_bytes(bytes))
+    }
+
+    pub const fn to_be_bytes(self) -> [u8; 4] {
+        self.0.to_be_bytes()
+    }
+
+    fn initial() -> Result<Self> {
+        let mut bytes = [0; RTPSIZE_NONCE_LEN];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| TransportCryptoError::NonceRandomnessUnavailable)?;
+        Ok(Self::from_be_bytes(bytes))
+    }
+
+    fn increment(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
 }
 
-impl<C> OutboundRtpState<C>
-where
-    C: RtpPayloadCodec,
-{
-    pub(crate) fn new(ssrc: u32) -> Self {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutboundCodecBinding {
+    ssrc: u32,
+    descriptor: DiscordCodecDescriptor,
+}
+
+impl OutboundCodecBinding {
+    pub(crate) fn new(codec: Codec, ssrc: u32) -> Self {
         Self {
+            ssrc,
+            descriptor: codecs::descriptor(codec),
+        }
+    }
+
+    pub(crate) fn codec(self) -> Codec {
+        self.descriptor.codec
+    }
+
+    pub(crate) fn media_type(self) -> MediaType {
+        self.descriptor.media_type()
+    }
+
+    pub(crate) fn payload_type(self) -> RtpPayloadType {
+        self.descriptor.payload_type
+    }
+
+    pub(crate) fn sample_rate(self) -> u32 {
+        self.descriptor.clock_rate_hz
+    }
+
+    pub(crate) fn ssrc(self) -> u32 {
+        self.ssrc
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboundRtpState {
+    seq: u16,
+    timestamp: u32,
+    nonce_suffix: RtpSizeNonceSuffix,
+    binding: OutboundCodecBinding,
+}
+
+impl OutboundRtpState {
+    pub(crate) fn new(binding: OutboundCodecBinding) -> Result<Self> {
+        Ok(Self {
             seq: 0,
             timestamp: 0,
-            nonce_suffix: initial_heartbeat_nonce() as u32,
-            ssrc,
-            payload_type: C::DISCORD_PAYLOAD_TYPE,
-            sample_rate: C::SAMPLE_RATE_HZ,
-            _codec: PhantomData,
-        }
+            nonce_suffix: RtpSizeNonceSuffix::initial()?,
+            binding,
+        })
+    }
+
+    pub(crate) fn codec(&self) -> Codec {
+        self.binding.codec()
+    }
+
+    pub(crate) fn ssrc(&self) -> u32 {
+        self.binding.ssrc()
+    }
+
+    pub(crate) fn update_binding(&mut self, binding: OutboundCodecBinding) {
+        self.binding = binding;
     }
 
     pub(crate) fn build_packet(
         &mut self,
         frame: &[u8],
+        marker: bool,
         duration: Duration,
         transport_crypto: &TransportCrypto,
         packet: &mut Vec<u8>,
     ) -> Result<OutboundPacket> {
         if frame.is_empty() {
             return Err(Error::InvalidInput(InvalidInputError::EmptyPayload {
-                codec: C::CODEC,
+                codec: self.binding.codec(),
             }));
         }
 
         let seq = self.seq;
         let timestamp = self.timestamp;
-        let nonce_suffix = self.nonce_suffix.to_be_bytes();
         let payload_bytes = frame.len();
         let rtp = transport_crypto.encrypt_payload(
             OutboundEncryptParams {
-                seq,
-                timestamp,
-                ssrc: self.ssrc,
-                payload_type: self.payload_type,
-                nonce_suffix,
+                header: RtpHeaderFields {
+                    seq,
+                    timestamp,
+                    ssrc: self.binding.ssrc(),
+                    payload_type: self.binding.payload_type(),
+                },
+                marker,
+                nonce_suffix: self.nonce_suffix,
             },
             frame,
             packet,
         )?;
 
         self.seq = self.seq.wrapping_add(1);
-        self.timestamp = self
-            .timestamp
-            .wrapping_add(timestamp_increment(self.sample_rate, duration));
-        self.nonce_suffix = self.nonce_suffix.wrapping_add(1);
+        if self.binding.media_type() == MediaType::Audio || marker {
+            self.timestamp = self
+                .timestamp
+                .wrapping_add(timestamp_increment(self.binding.sample_rate(), duration));
+        }
+        let nonce_suffix = self.nonce_suffix;
+        self.nonce_suffix.increment();
 
         Ok(OutboundPacket {
             rtp,
@@ -376,54 +690,21 @@ pub(crate) struct TransportCrypto {
     cipher: TransportCipher,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct TransportSecretKey(Zeroizing<[u8; 32]>);
+type TransportSecretKey = RedactedSecret<[u8; 32]>;
 
-impl fmt::Debug for TransportSecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
-impl TransportSecretKey {
-    pub(crate) fn from_slice(secret_key: &[u8]) -> Result<Self> {
-        secret_key
-            .try_into()
-            .map(|secret_key| Self(Zeroizing::new(secret_key)))
-            .map_err(|_| TransportCryptoError::InvalidSecretKeyLen {
-                len: secret_key.len(),
-            })
-            .map_err(Into::into)
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.0[..]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TransportMode {
-    AeadAes256GcmRtpSize,
-    AeadXChaCha20Poly1305RtpSize,
-}
-
-impl TransportMode {
-    pub(crate) fn from_encryption_mode(mode: &EncryptionMode) -> Result<Self> {
-        match mode.as_str() {
-            "aead_aes256_gcm_rtpsize" => Ok(Self::AeadAes256GcmRtpSize),
-            "aead_xchacha20_poly1305_rtpsize" => Ok(Self::AeadXChaCha20Poly1305RtpSize),
-            _ => Err(TransportCryptoError::UnsupportedMode {
-                mode: mode.clone(),
-                direction: TransportCryptoDirection::Session,
-            }
-            .into()),
-        }
-    }
+fn transport_secret_key_from_slice(secret_key: &[u8]) -> Result<TransportSecretKey> {
+    secret_key
+        .try_into()
+        .map(TransportSecretKey::new)
+        .map_err(|_| TransportCryptoError::InvalidSecretKeyLen {
+            len: secret_key.len(),
+        })
+        .map_err(Into::into)
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TransportCryptoConfig {
-    mode: TransportMode,
+    mode: EncryptionMode,
     secret_key: TransportSecretKey,
 }
 
@@ -437,10 +718,10 @@ impl fmt::Debug for TransportCryptoConfig {
 }
 
 impl TransportCryptoConfig {
-    pub(crate) fn new(mode: &EncryptionMode, secret_key: &[u8]) -> Result<Self> {
+    pub(crate) fn new(mode: EncryptionMode, secret_key: &[u8]) -> Result<Self> {
         Ok(Self {
-            mode: TransportMode::from_encryption_mode(mode)?,
-            secret_key: TransportSecretKey::from_slice(secret_key)?,
+            mode,
+            secret_key: transport_secret_key_from_slice(secret_key)?,
         })
     }
 }
@@ -450,14 +731,76 @@ enum TransportCipher {
     XChaCha20Poly1305(XChaCha20Poly1305),
 }
 
+impl TransportCipher {
+    fn decrypt_in_place_detached(
+        &self,
+        nonce_suffix: RtpSizeNonceSuffix,
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &[u8],
+    ) -> std::result::Result<(), TransportCryptoError> {
+        match self {
+            Self::Aes256Gcm(cipher) => cipher
+                .decrypt_in_place_detached(
+                    AesNonce::from_slice(&rtpsize_nonce::<12>(nonce_suffix)),
+                    aad,
+                    payload,
+                    AesTag::from_slice(tag),
+                )
+                .map_err(|_| TransportCryptoError::AesGcmDecryptFailed),
+            Self::XChaCha20Poly1305(cipher) => cipher
+                .decrypt_in_place_detached(
+                    XNonce::from_slice(&rtpsize_nonce::<24>(nonce_suffix)),
+                    aad,
+                    payload,
+                    XTag::from_slice(tag),
+                )
+                .map_err(|_| TransportCryptoError::XChaCha20Poly1305DecryptFailed),
+        }
+    }
+
+    fn encrypt_in_place_detached(
+        &self,
+        nonce_suffix: RtpSizeNonceSuffix,
+        aad: &[u8],
+        payload: &mut [u8],
+    ) -> std::result::Result<[u8; AEAD_TAG_LEN], TransportCryptoError> {
+        let tag = match self {
+            Self::Aes256Gcm(cipher) => cipher
+                .encrypt_in_place_detached(
+                    AesNonce::from_slice(&rtpsize_nonce::<12>(nonce_suffix)),
+                    aad,
+                    payload,
+                )
+                .map_err(|_| TransportCryptoError::AesGcmEncryptFailed)?,
+            Self::XChaCha20Poly1305(cipher) => cipher
+                .encrypt_in_place_detached(
+                    XNonce::from_slice(&rtpsize_nonce::<24>(nonce_suffix)),
+                    aad,
+                    payload,
+                )
+                .map_err(|_| TransportCryptoError::XChaCha20Poly1305EncryptFailed)?,
+        };
+        let mut bytes = [0; AEAD_TAG_LEN];
+        bytes.copy_from_slice(&tag);
+        Ok(bytes)
+    }
+}
+
+fn rtpsize_nonce<const N: usize>(suffix: RtpSizeNonceSuffix) -> [u8; N] {
+    let mut nonce = [0_u8; N];
+    nonce[..RTPSIZE_NONCE_LEN].copy_from_slice(&suffix.to_be_bytes());
+    nonce
+}
+
 impl TransportCrypto {
     pub(crate) fn from_config(config: &TransportCryptoConfig) -> Result<Self> {
         let cipher = match config.mode {
-            TransportMode::AeadAes256GcmRtpSize => TransportCipher::Aes256Gcm(Box::new(
+            EncryptionMode::AeadAes256GcmRtpSize => TransportCipher::Aes256Gcm(Box::new(
                 Aes256Gcm::new_from_slice(config.secret_key.as_slice())
                     .map_err(|_| TransportCryptoError::InvalidAesGcmKey)?,
             )),
-            TransportMode::AeadXChaCha20Poly1305RtpSize => TransportCipher::XChaCha20Poly1305(
+            EncryptionMode::AeadXChaCha20Poly1305RtpSize => TransportCipher::XChaCha20Poly1305(
                 XChaCha20Poly1305::new_from_slice(config.secret_key.as_slice())
                     .map_err(|_| TransportCryptoError::InvalidXChaCha20Poly1305Key)?,
             ),
@@ -482,40 +825,17 @@ impl TransportCrypto {
 
         let nonce_suffix_offset = packet.len() - RTPSIZE_NONCE_LEN;
         let tag_offset = nonce_suffix_offset - AEAD_TAG_LEN;
-        let nonce_suffix = &packet[nonce_suffix_offset..];
+        let mut nonce_suffix = [0; 4];
+        nonce_suffix.copy_from_slice(&packet[nonce_suffix_offset..]);
+        let nonce_suffix = RtpSizeNonceSuffix::from_be_bytes(nonce_suffix);
         let tag = &packet[tag_offset..nonce_suffix_offset];
         let aad = &packet[..rtp.encrypted_body_offset];
         output.clear();
         output.extend_from_slice(&packet[rtp.encrypted_body_offset..tag_offset]);
         let opus_offset = rtp.header_len - rtp.encrypted_body_offset;
 
-        match &self.cipher {
-            TransportCipher::Aes256Gcm(cipher) => {
-                let mut nonce = [0_u8; 12];
-                nonce[..RTPSIZE_NONCE_LEN].copy_from_slice(nonce_suffix);
-                cipher
-                    .decrypt_in_place_detached(
-                        AesNonce::from_slice(&nonce),
-                        aad,
-                        output,
-                        AesTag::from_slice(tag),
-                    )
-                    .map_err(|_| TransportCryptoError::AesGcmDecryptFailed)?;
-            }
-            TransportCipher::XChaCha20Poly1305(cipher) => {
-                let mut nonce = [0_u8; 24];
-                nonce[..RTPSIZE_NONCE_LEN].copy_from_slice(nonce_suffix);
-                cipher
-                    .decrypt_in_place_detached(
-                        XNonce::from_slice(&nonce),
-                        aad,
-                        output,
-                        XTag::from_slice(tag),
-                    )
-                    .map_err(|_| TransportCryptoError::XChaCha20Poly1305DecryptFailed)?;
-            }
-        }
-
+        self.cipher
+            .decrypt_in_place_detached(nonce_suffix, aad, output, tag)?;
         strip_decrypted_rtp_payload(output, opus_offset, rtp).map_err(Into::into)
     }
 
@@ -527,38 +847,19 @@ impl TransportCrypto {
     ) -> Result<RtpHeader> {
         packet.clear();
         packet.reserve(12 + frame.len() + AEAD_TAG_LEN + RTPSIZE_NONCE_LEN);
-        let rtp = write_rtp_header(
-            packet,
-            params.seq,
-            params.timestamp,
-            params.ssrc,
-            params.payload_type,
-        );
+        let rtp = RtpHeaderBuilder::new(params.header)
+            .marker(params.marker)
+            .write_to(packet);
         let payload_offset = packet.len();
         packet.extend_from_slice(frame);
 
-        match &self.cipher {
-            TransportCipher::Aes256Gcm(cipher) => {
-                let mut nonce = [0_u8; 12];
-                nonce[..RTPSIZE_NONCE_LEN].copy_from_slice(&params.nonce_suffix);
-                let (aad, payload) = packet.split_at_mut(payload_offset);
-                let tag = cipher
-                    .encrypt_in_place_detached(AesNonce::from_slice(&nonce), aad, payload)
-                    .map_err(|_| TransportCryptoError::AesGcmEncryptFailed)?;
-                packet.extend_from_slice(&tag);
-            }
-            TransportCipher::XChaCha20Poly1305(cipher) => {
-                let mut nonce = [0_u8; 24];
-                nonce[..RTPSIZE_NONCE_LEN].copy_from_slice(&params.nonce_suffix);
-                let (aad, payload) = packet.split_at_mut(payload_offset);
-                let tag = cipher
-                    .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, payload)
-                    .map_err(|_| TransportCryptoError::XChaCha20Poly1305EncryptFailed)?;
-                packet.extend_from_slice(&tag);
-            }
-        }
+        let (aad, payload) = packet.split_at_mut(payload_offset);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(params.nonce_suffix, aad, payload)?;
+        packet.extend_from_slice(&tag);
 
-        packet.extend_from_slice(&params.nonce_suffix);
+        packet.extend_from_slice(&params.nonce_suffix.to_be_bytes());
         Ok(rtp)
     }
 }
@@ -587,32 +888,6 @@ fn strip_decrypted_rtp_payload(
     Ok(())
 }
 
-pub(crate) fn detect_rtp_codec(
-    rtp: &RtpHeader,
-    session_description: &SessionDescription,
-) -> std::result::Result<MediaCodec, UnsupportedCodecError> {
-    let codec =
-        session_description
-            .audio_codec
-            .as_deref()
-            .map_or(Ok(MediaCodec::Opus), |codec| {
-                MediaCodec::from_discord_audio_name(codec).ok_or_else(|| {
-                    UnsupportedCodecError::UnsupportedAudioCodec {
-                        codec: codec.to_string(),
-                    }
-                })
-            })?;
-    let expected_payload_type = codec.default_discord_payload_type();
-    if rtp.payload_type != expected_payload_type {
-        return Err(UnsupportedCodecError::UnsupportedRtpPayloadType {
-            payload_type: rtp.payload_type,
-            expected_payload_type,
-            codec,
-        });
-    }
-    Ok(codec)
-}
-
 pub(crate) fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
@@ -621,65 +896,11 @@ pub(crate) fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-pub(crate) fn parse_rtp_header(bytes: &[u8]) -> std::result::Result<RtpHeader, RtpError> {
-    let fixed =
-        RtpFixedHeader::parse(bytes).ok_or(RtpError::PacketTooShort { len: bytes.len() })?;
-    if fixed.version != RTP_VERSION {
-        return Err(RtpError::UnsupportedVersion {
-            version: fixed.version,
-        });
-    }
-
-    let csrc_count = usize::from(fixed.csrc_count);
-    let mut header_len = 12 + csrc_count * 4;
-    if bytes.len() < header_len {
-        return Err(RtpError::TruncatedCsrcList {
-            len: bytes.len(),
-            expected_header_len: header_len,
-        });
-    }
-
-    let mut encrypted_body_offset = header_len;
-    if fixed.extension {
-        if bytes.len() < header_len + 4 {
-            return Err(RtpError::TruncatedExtensionHeader {
-                len: bytes.len(),
-                expected_header_len: header_len + 4,
-            });
-        }
-        encrypted_body_offset += 4;
-        let extension_words = usize::from(u16::from_be_bytes([
-            bytes[header_len + 2],
-            bytes[header_len + 3],
-        ]));
-        header_len += 4 + extension_words * 4;
-        if bytes.len() < header_len {
-            return Err(RtpError::TruncatedExtensionPayload {
-                len: bytes.len(),
-                expected_header_len: header_len,
-            });
-        }
-    }
-
-    Ok(RtpHeader {
-        version: fixed.version,
-        padding: fixed.padding,
-        extension: fixed.extension,
-        marker: fixed.marker,
-        payload_type: fixed.payload_type,
-        seq: fixed.seq,
-        timestamp: fixed.timestamp,
-        ssrc: fixed.ssrc,
-        header_len,
-        encrypted_body_offset,
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn decrypt_transport_payload(
     packet: &[u8],
     rtp: &RtpHeader,
-    mode: &EncryptionMode,
+    mode: EncryptionMode,
     secret_key: &[u8],
 ) -> Result<Vec<u8>> {
     let transport_crypto =
@@ -691,18 +912,16 @@ pub(crate) fn decrypt_transport_payload(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OutboundEncryptParams {
-    pub(crate) seq: u16,
-    pub(crate) timestamp: u32,
-    pub(crate) ssrc: u32,
-    pub(crate) payload_type: u8,
-    pub(crate) nonce_suffix: [u8; 4],
+    pub(crate) header: RtpHeaderFields,
+    pub(crate) marker: bool,
+    pub(crate) nonce_suffix: RtpSizeNonceSuffix,
 }
 
 #[cfg(test)]
 pub(crate) fn encrypt_transport_payload(
     params: OutboundEncryptParams,
     frame: Vec<u8>,
-    mode: &EncryptionMode,
+    mode: EncryptionMode,
     secret_key: &[u8],
 ) -> Result<Vec<u8>> {
     let transport_crypto =
@@ -713,36 +932,21 @@ pub(crate) fn encrypt_transport_payload(
 }
 
 #[cfg(test)]
-pub(crate) fn build_rtp_header(seq: u16, timestamp: u32, ssrc: u32, payload_type: u8) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(12);
-    write_rtp_header(&mut packet, seq, timestamp, ssrc, payload_type);
-    packet
-}
-
-pub(crate) fn write_rtp_header(
-    packet: &mut Vec<u8>,
+pub(crate) fn build_rtp_header(
     seq: u16,
     timestamp: u32,
     ssrc: u32,
-    payload_type: u8,
-) -> RtpHeader {
-    let payload_type = payload_type & 0x7f;
-    packet.extend_from_slice(&[RTP_VERSION << 6, payload_type]);
-    packet.extend_from_slice(&seq.to_be_bytes());
-    packet.extend_from_slice(&timestamp.to_be_bytes());
-    packet.extend_from_slice(&ssrc.to_be_bytes());
-    RtpHeader {
-        version: RTP_VERSION,
-        padding: false,
-        extension: false,
-        marker: false,
-        payload_type,
+    payload_type: RtpPayloadType,
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12);
+    RtpHeaderBuilder::new(RtpHeaderFields {
         seq,
         timestamp,
         ssrc,
-        header_len: 12,
-        encrypted_body_offset: 12,
-    }
+        payload_type,
+    })
+    .write_to(&mut packet);
+    packet
 }
 
 pub(crate) fn timestamp_increment(sample_rate: u32, duration: Duration) -> u32 {
@@ -750,148 +954,125 @@ pub(crate) fn timestamp_increment(sample_rate: u32, duration: Duration) -> u32 {
     samples.max(1).min(u128::from(u32::MAX)) as u32
 }
 
-pub(crate) fn initial_heartbeat_nonce() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64 % JS_MAX_SAFE_INTEGER)
-        .unwrap_or(0)
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeartbeatNonce(u64);
 
-pub(crate) fn next_heartbeat_nonce(current: &mut u64) -> u64 {
-    *current = current.wrapping_add(1) % JS_MAX_SAFE_INTEGER;
-    *current
-}
-
-pub(crate) fn select_encryption_mode(
-    options: &ConnectionOptions,
-    ready: &GatewayReady,
-) -> Result<EncryptionMode> {
-    if let Some(preferred_mode) = &options.preferred_mode
-        && ready.modes.contains(preferred_mode)
-    {
-        return Ok(preferred_mode.clone());
+impl HeartbeatNonce {
+    pub(crate) fn initial() -> Result<Self> {
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| TransportCryptoError::NonceRandomnessUnavailable)?;
+        Ok(Self(u64::from_be_bytes(bytes) % crate::JS_MAX_SAFE_INTEGER))
     }
 
-    for mode in [
-        EncryptionMode::aead_aes256_gcm_rtpsize(),
-        EncryptionMode::aead_xchacha20_poly1305_rtpsize(),
-    ] {
-        if ready.modes.contains(&mode) {
-            return Ok(mode);
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(1) % crate::JS_MAX_SAFE_INTEGER;
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VoiceEndpoint<'a> {
+    websocket_url: &'a str,
+}
+
+impl<'a> VoiceEndpoint<'a> {
+    pub(crate) const fn new(websocket_url: &'a str) -> Self {
+        Self { websocket_url }
+    }
+
+    pub(crate) async fn connect_websocket(self) -> Result<GatewayWebSocketConnectResult> {
+        let (host, port) = self.host_port()?;
+        let addresses = ordered_voice_socket_addrs(
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|source| {
+                    Error::Protocol(ProtocolError::ResolveWebSocketEndpoint {
+                        host: host.clone(),
+                        port,
+                        source,
+                    })
+                })?,
+        );
+        if addresses.is_empty() {
+            return Err(Error::Protocol(
+                ProtocolError::WebSocketEndpointNoAddresses { host, port },
+            ));
         }
-    }
 
-    if ready.modes.is_empty() {
-        return Err(Error::Protocol(ProtocolError::ReadyMissingEncryptionModes));
-    }
-    Err(Error::Protocol(
-        ProtocolError::ReadyMissingSupportedEncryptionMode {
-            modes: ready.modes.clone(),
-        },
-    ))
-}
-
-pub(crate) fn update_state(
-    state: &mut ConnectionStateStore,
-    update: impl FnOnce(&mut ConnectionInternalState),
-) {
-    state.update(update);
-}
-
-pub(crate) async fn connect_websocket(
-    websocket_url: &str,
-) -> Result<GatewayWebSocketConnectResult> {
-    let (host, port) = websocket_host_port(websocket_url)?;
-    let addresses = ordered_voice_socket_addrs(
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|source| {
-                Error::Protocol(ProtocolError::ResolveWebSocketEndpoint {
-                    host: host.clone(),
-                    port,
-                    source,
-                })
-            })?,
-    );
-    if addresses.is_empty() {
-        return Err(Error::Protocol(
-            ProtocolError::WebSocketEndpointNoAddresses { host, port },
-        ));
-    }
-
-    let mut attempts = FuturesUnordered::new();
-    for (index, address) in addresses.iter().copied().enumerate() {
-        let websocket_url = websocket_url.to_string();
-        attempts.push(async move {
-            if index > 0 {
-                sleep(WEBSOCKET_ADDRESS_STAGGER.saturating_mul(index as u32)).await;
-            }
-            match timeout(
-                WEBSOCKET_ADDRESS_CONNECT_TIMEOUT,
-                connect_websocket_address(websocket_url, address),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Error::Protocol(
-                    ProtocolError::WebSocketAddressConnectTimeout {
-                        address,
-                        duration: WEBSOCKET_ADDRESS_CONNECT_TIMEOUT,
-                    },
-                )),
-            }
-        });
-    }
-
-    let mut errors = Vec::new();
-    while let Some(result) = attempts.next().await {
-        match result {
-            Ok(connection) => return Ok(connection),
-            Err(error) => errors.push(error.to_string()),
+        let mut attempts = FuturesUnordered::new();
+        for (index, address) in addresses.iter().copied().enumerate() {
+            attempts.push(async move {
+                if index > 0 {
+                    sleep(WEBSOCKET_ADDRESS_STAGGER.saturating_mul(index as u32)).await;
+                }
+                match timeout(
+                    WEBSOCKET_ADDRESS_CONNECT_TIMEOUT,
+                    self.connect_websocket_address(address),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(Error::Protocol(
+                        ProtocolError::WebSocketAddressConnectTimeout {
+                            address,
+                            duration: WEBSOCKET_ADDRESS_CONNECT_TIMEOUT,
+                        },
+                    )),
+                }
+            });
         }
+
+        let mut errors = Vec::new();
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok(connection) => return Ok(connection),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        Err(Error::Protocol(
+            ProtocolError::WebSocketAllAddressesFailed {
+                host,
+                port,
+                address_count: addresses.len(),
+                errors,
+            },
+        ))
     }
 
-    Err(Error::Protocol(
-        ProtocolError::WebSocketAllAddressesFailed {
-            host,
-            port,
-            address_count: addresses.len(),
-            errors,
-        },
-    ))
-}
+    async fn connect_websocket_address(
+        self,
+        address: SocketAddr,
+    ) -> Result<GatewayWebSocketConnectResult> {
+        let socket = TcpStream::connect(address)
+            .await
+            .map_err(|source| Error::Protocol(ProtocolError::TcpConnect { address, source }))?;
+        socket.set_nodelay(true)?;
+        client_async_tls_with_config(self.websocket_url, socket, None, None)
+            .await
+            .map_err(Into::into)
+    }
 
-pub(crate) async fn connect_websocket_address(
-    websocket_url: String,
-    address: SocketAddr,
-) -> Result<GatewayWebSocketConnectResult> {
-    let socket = TcpStream::connect(address)
-        .await
-        .map_err(|source| Error::Protocol(ProtocolError::TcpConnect { address, source }))?;
-    socket.set_nodelay(true)?;
-    client_async_tls_with_config(websocket_url, socket, None, None)
-        .await
-        .map_err(Into::into)
-}
-
-pub(crate) fn websocket_host_port(websocket_url: &str) -> Result<(String, u16)> {
-    let request = websocket_url.into_client_request()?;
-    let uri = request.uri();
-    let host = uri
-        .host()
-        .ok_or(Error::Protocol(ProtocolError::WebSocketUrlMissingHost))?
-        .to_string();
-    let port = uri
-        .port_u16()
-        .or_else(|| match uri.scheme_str() {
-            Some("wss") => Some(443),
-            Some("ws") => Some(80),
-            _ => None,
-        })
-        .ok_or(Error::Protocol(
-            ProtocolError::WebSocketUrlMissingUsableScheme,
-        ))?;
-    Ok((host, port))
+    pub(crate) fn host_port(self) -> Result<(String, u16)> {
+        let request = self.websocket_url.into_client_request()?;
+        let uri = request.uri();
+        let host = uri
+            .host()
+            .ok_or(Error::Protocol(ProtocolError::WebSocketUrlMissingHost))?
+            .to_string();
+        let port = uri
+            .port_u16()
+            .or_else(|| match uri.scheme_str() {
+                Some("wss") => Some(443),
+                Some("ws") => Some(80),
+                _ => None,
+            })
+            .ok_or(Error::Protocol(
+                ProtocolError::WebSocketUrlMissingUsableScheme,
+            ))?;
+        Ok((host, port))
+    }
 }
 
 pub(crate) fn ordered_voice_socket_addrs(
@@ -909,22 +1090,38 @@ pub(crate) fn ordered_voice_socket_addrs(
     ipv4
 }
 
-pub(crate) fn udp_bind_addr_for_remote(remote: IpAddr) -> SocketAddr {
-    SocketAddr::new(
-        match remote {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        },
-        0,
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VoiceUdpRemote {
+    ip: IpAddr,
 }
 
-pub(crate) async fn bind_udp_socket(remote_ip: &str) -> Result<UdpSocket> {
-    let remote = remote_ip.parse::<IpAddr>().map_err(|source| {
-        Error::Protocol(ProtocolError::InvalidDiscordVoiceUdpIp {
-            remote_ip: remote_ip.to_string(),
-            source,
-        })
-    })?;
-    Ok(UdpSocket::bind(udp_bind_addr_for_remote(remote)).await?)
+impl VoiceUdpRemote {
+    pub(crate) const fn new(ip: IpAddr) -> Self {
+        Self { ip }
+    }
+
+    pub(crate) fn parse(remote_ip: &str) -> Result<Self> {
+        Ok(Self::new(remote_ip.parse::<IpAddr>().map_err(
+            |source| {
+                Error::Protocol(ProtocolError::InvalidDiscordVoiceUdpIp {
+                    remote_ip: remote_ip.to_string(),
+                    source,
+                })
+            },
+        )?))
+    }
+
+    pub(crate) fn bind_addr(self) -> SocketAddr {
+        SocketAddr::new(
+            match self.ip {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            0,
+        )
+    }
+
+    pub(crate) async fn bind_socket(self) -> Result<UdpSocket> {
+        Ok(UdpSocket::bind(self.bind_addr()).await?)
+    }
 }

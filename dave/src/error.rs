@@ -7,7 +7,10 @@ use openmls::{
         MergePendingCommitError, NewGroupError, ProcessMessageError, RemoveProposalError,
         WelcomeError,
     },
-    prelude::{CryptoError, InvalidExtensionError, KeyPackageNewError, tls_codec},
+    prelude::{
+        Ciphersuite, CredentialType, CryptoError, InvalidExtensionError, KeyPackageNewError,
+        ProtocolVersion, tls_codec,
+    },
 };
 use openmls_rust_crypto::MemoryStorageError;
 use thiserror::Error as ThisError;
@@ -20,10 +23,94 @@ pub struct UnsupportedProtocolVersion(pub NonZeroU16);
 
 #[derive(Debug, ThisError)]
 pub enum InitError {
-    #[error("{0}")]
-    UnsupportedProtocolVersion(#[from] UnsupportedProtocolVersion),
     #[error("failed to generate signature key pair: {0}")]
     KeyPairGeneration(#[from] CryptoError),
+    #[error("invalid DAVE identity key: {0}")]
+    IdentityKey(#[from] IdentityKeyError),
+}
+
+#[derive(Clone, Debug, ThisError, PartialEq, Eq)]
+pub enum IdentityKeyError {
+    #[error("invalid P-256 private key")]
+    InvalidP256PrivateKey,
+    #[error("persistent public-key upload requires a persistent identity key")]
+    EphemeralPublicKeyUpload,
+    #[error("client auth session ID cannot be empty")]
+    EmptyClientAuthSessionId,
+    #[error("MLS variable-length vector length {0} is too large")]
+    MlsVectorTooLarge(usize),
+}
+
+#[derive(Clone, Debug, ThisError, PartialEq, Eq)]
+pub enum FingerprintError {
+    #[error("DAVE pairwise fingerprint scrypt parameters are invalid")]
+    InvalidScryptParams,
+    #[error("DAVE pairwise fingerprint output length is invalid")]
+    InvalidOutputLength,
+}
+
+#[derive(Clone, Debug, ThisError, PartialEq, Eq)]
+pub enum DisplayableCodeError {
+    #[error("display-code group size {0} is invalid")]
+    InvalidGroupSize(usize),
+    #[error(
+        "display-code digit count {digit_count} is not a non-zero multiple of group size {group_digits}"
+    )]
+    InvalidDigitCount {
+        digit_count: usize,
+        group_digits: usize,
+    },
+    #[error("display-code input has {actual} bytes; {required} bytes are required")]
+    InputTooShort { actual: usize, required: usize },
+}
+
+#[derive(Debug, ThisError)]
+pub enum CredentialPolicyError {
+    #[error("credential type {actual:?} is not allowed; expected Basic")]
+    UnexpectedType { actual: CredentialType },
+    #[error("failed to convert Basic credential content to a user ID: {0}")]
+    UserIdContent(TryFromSliceError),
+}
+
+#[derive(Debug, ThisError)]
+pub enum GroupPolicyError {
+    #[error("DAVE MLS group uses protocol version {actual:?}; expected Mls10")]
+    UnexpectedProtocolVersion { actual: ProtocolVersion },
+    #[error("DAVE MLS group uses ciphersuite {actual:?}; expected {expected:?}")]
+    UnexpectedCiphersuite {
+        actual: Ciphersuite,
+        expected: Ciphersuite,
+    },
+    #[error(
+        "DAVE MLS group has {actual} group-context extensions; expected exactly one ExternalSenders extension"
+    )]
+    UnexpectedGroupExtensionCount { actual: usize },
+    #[error("DAVE MLS group does not contain an ExternalSenders group-context extension")]
+    MissingExternalSenderExtension,
+    #[error("DAVE MLS group contains {0} external senders; expected exactly one")]
+    InvalidExternalSenderCount(usize),
+    #[error("DAVE MLS group external sender does not match the gateway external sender")]
+    UnexpectedExternalSender,
+    #[error("DAVE MLS leaf node has {actual} extensions; expected none")]
+    UnexpectedLeafExtensionCount { actual: usize },
+    #[error("DAVE MLS leaf node capabilities are outside the DAVE profile")]
+    UnexpectedLeafCapabilities,
+    #[error("DAVE MLS group member credential violates policy: {0}")]
+    MemberCredential(#[from] CredentialPolicyError),
+    #[error("DAVE MLS group contains duplicate member credential for user {0}")]
+    DuplicateMemberCredential(u64),
+}
+
+#[derive(Debug, ThisError)]
+pub enum VerificationError {
+    #[error("cannot inspect DAVE verification state without an established MLS group")]
+    NoEstablishedGroup,
+    #[error("DAVE MLS group member credential violates policy: {0}")]
+    MemberCredential(#[from] CredentialPolicyError),
+    #[error("failed to build DAVE verification display code: {0}")]
+    DisplayableCode(#[from] DisplayableCodeError),
+    #[error("failed to build DAVE pairwise fingerprint: {0}")]
+    Fingerprint(#[from] FingerprintError),
 }
 
 #[derive(Debug, ThisError)]
@@ -72,14 +159,20 @@ pub enum ProcessProposalsError {
     MessageNotPublicOrPrivate(#[from] ProtocolMessageError),
     #[error("failed to process MLS message: {0}")]
     ProcessMessage(#[from] ProcessMessageError<MemoryStorageError>),
-    #[error("failed to convert credential content to user ID: {0}")]
-    CredentialContent(TryFromSliceError),
+    #[error("DAVE proposal credential violates policy: {0}")]
+    Credential(#[from] CredentialPolicyError),
+    #[error("DAVE proposal was not sent by the gateway external sender")]
+    UnexpectedProposalSender,
+    #[error("DAVE proposal type is not allowed")]
+    UnexpectedProposalType,
     #[error("unexpected proposed user {0}")]
     UnexpectedUser(u64),
     #[error("failed to store pending proposal: {0}")]
     StorePendingProposal(MemoryStorageError),
     #[error("processed MLS message was not a proposal")]
     MessageNotProposal,
+    #[error("DAVE proposal violates group policy: {0}")]
+    GroupPolicy(#[from] GroupPolicyError),
     #[error("failed to deserialize proposal reference: {0}")]
     DeserializeProposalRef(tls_codec::Error),
     #[error("failed to remove pending proposal: {0}")]
@@ -104,12 +197,8 @@ pub enum ProcessWelcomeError {
     DeserializeWelcome(#[from] tls_codec::Error),
     #[error("failed to create staged welcome: {0}")]
     StageWelcome(#[from] WelcomeError<MemoryStorageError>),
-    #[error("welcome did not contain external senders extension")]
-    MissingExternalSenderExtension,
-    #[error("welcome contained {0} external senders; expected exactly one")]
-    InvalidExternalSenderCount(usize),
-    #[error("welcome external sender does not match the gateway external sender")]
-    UnexpectedExternalSender,
+    #[error("DAVE welcome violates group policy: {0}")]
+    GroupPolicy(#[from] GroupPolicyError),
     #[error("failed to delete pending MLS group: {0}")]
     DeletePendingGroup(MemoryStorageError),
     #[error("failed to update media ratchets: {0}")]
@@ -120,6 +209,8 @@ pub enum ProcessWelcomeError {
 pub enum ProcessCommitError {
     #[error("cannot process DAVE commit without an MLS group")]
     NoGroup,
+    #[error("cannot process DAVE commit without a gateway external sender")]
+    NoExternalSender,
     #[error("cannot process DAVE commit for a pending MLS group")]
     PendingGroup,
     #[error("failed to deserialize DAVE commit: {0}")]
@@ -128,6 +219,18 @@ pub enum ProcessCommitError {
     MessageNotPublicOrPrivate(#[from] ProtocolMessageError),
     #[error("DAVE commit was for a different MLS group")]
     WrongGroup,
+    #[error("DAVE own commit did not match the pending local commit")]
+    UnexpectedOwnCommit,
+    #[error("DAVE commit includes an inline proposal")]
+    InlineProposal,
+    #[error("DAVE commit contains a proposal type not allowed by DAVE")]
+    UnexpectedProposalType,
+    #[error("DAVE commit sender is not a group member")]
+    UnexpectedCommitSender,
+    #[error("DAVE commit member credential violates policy: {0}")]
+    MemberCredential(#[from] CredentialPolicyError),
+    #[error("DAVE commit violates group policy: {0}")]
+    GroupPolicy(#[from] GroupPolicyError),
     #[error("failed to merge own pending commit: {0}")]
     MergePendingCommit(#[from] MergePendingCommitError<MemoryStorageError>),
     #[error("failed to merge staged commit: {0}")]
@@ -144,10 +247,14 @@ pub enum ProcessCommitError {
 pub enum UpdateRatchetsError {
     #[error("cannot derive DAVE media ratchets without an established MLS group")]
     NoEstablishedGroup,
+    #[error("pending MLS group has {members} members; expected sole local member")]
+    PendingGroupMemberCount { members: usize },
+    #[error("pending MLS group member {member} is not the local user {local}")]
+    PendingGroupMemberMismatch { member: u64, local: u64 },
     #[error("failed to export MLS secret: {0}")]
     ExportSecret(#[from] ExportSecretError),
-    #[error("failed to convert member credential content to user ID: {0}")]
-    MemberCredentialContent(TryFromSliceError),
+    #[error("DAVE member credential violates policy: {0}")]
+    MemberCredential(#[from] CredentialPolicyError),
     #[error("failed to derive ratchet secret")]
     DeriveSecret,
 }
@@ -156,13 +263,6 @@ pub enum UpdateRatchetsError {
 pub enum EncryptError {
     #[error("DAVE sender ratchet is not active")]
     SenderNotReady,
-    #[error("unsupported codec {codec:?} for media type {media_type:?}")]
-    UnsupportedCodec {
-        media_type: MediaType,
-        codec: crate::frame::Codec,
-    },
-    #[error("encrypted output buffer is too small: need {needed} bytes, got {available}")]
-    OutputTooSmall { needed: usize, available: usize },
     #[error("failed to initialize AES-GCM cipher")]
     InvalidKey,
     #[error("AES-GCM encryption failed")]
@@ -206,8 +306,6 @@ pub enum FrameDecryptError {
         plaintext_capacity: usize,
         manager_count: usize,
     },
-    #[error("decrypted output buffer is too small: need {needed} bytes, got {available}")]
-    OutputTooSmall { needed: usize, available: usize },
     #[error("failed to initialize AES-GCM cipher")]
     InvalidKey,
 }

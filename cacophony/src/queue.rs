@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     hash::Hash,
     marker::PhantomData,
+    num::NonZeroUsize,
 };
 
 use tokio::{sync::oneshot, time::Instant};
@@ -10,11 +11,11 @@ use crate::errors::{Error, Result};
 
 pub(crate) struct BoundedDeque<T> {
     items: VecDeque<T>,
-    capacity: usize,
+    capacity: NonZeroUsize,
 }
 
 impl<T> BoundedDeque<T> {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: NonZeroUsize) -> Self {
         Self {
             items: VecDeque::new(),
             capacity,
@@ -26,7 +27,7 @@ impl<T> BoundedDeque<T> {
     }
 
     pub(crate) fn push_front(&mut self, item: T) -> Option<T> {
-        let dropped = if self.items.len() >= self.capacity {
+        let dropped = if self.items.len() >= self.capacity.get() {
             self.items.pop_back()
         } else {
             None
@@ -36,7 +37,7 @@ impl<T> BoundedDeque<T> {
     }
 
     pub(crate) fn push_back(&mut self, item: T) -> Option<T> {
-        let dropped = if self.items.len() >= self.capacity {
+        let dropped = if self.items.len() >= self.capacity.get() {
             self.items.pop_front()
         } else {
             None
@@ -50,7 +51,7 @@ impl<T> BoundedDeque<T> {
     }
 
     pub(crate) fn has_capacity(&self) -> bool {
-        self.items.len() < self.capacity
+        self.items.len() < self.capacity.get()
     }
 
     pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {

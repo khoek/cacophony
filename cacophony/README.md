@@ -1,6 +1,6 @@
 # cacophony
 
-High-performance Discord voice runtime for Rust. `cacophony` owns the Discord
+High-performance Discord voice runtime for Rust. `cacophony` provides the Discord
 voice transport path: voice gateway negotiation, UDP discovery, RTP send/receive,
 AEAD transport crypto, Opus packet playout, DAVE coordination, and typed
 connection observers.
@@ -33,10 +33,10 @@ pipeline stack.
 
 ## Current media support
 
-`cacophony` currently supports Discord Opus voice media. The lower-level `dave`
-crate implements the full DAVE frame transform codec set, but this runtime does
-not yet expose Discord video packetization/depacketization or playout APIs.
-Non-Opus Discord media is rejected explicitly.
+`cacophony` negotiates and packetizes the full Discord/DAVE media set: Opus
+audio plus AV1, H265, H264, VP8, and VP9 video. Opus has high-level
+encode/decode and playout helpers; video callers provide encoded frames directly
+and receive assembled encoded frames through the low-level media APIs.
 
 ## Example
 
@@ -65,10 +65,7 @@ async fn play_one_packet(
     .await?;
 
     let playout = connection.start_opus_playout().await?;
-    playout.push_packet_owned(Packet {
-        bytes: opus_packet,
-        duration: std::time::Duration::from_millis(20),
-    }).await?;
+    playout.push_packet(Packet::from_bytes(opus_packet)?).await?;
 
     let stats = playout.finish().await?;
     assert_eq!(stats.packets, 1);

@@ -1,26 +1,31 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
 
-use dave::DAVE_PROTOCOL_VERSION;
+use dave::{Codec, DAVE_PROTOCOL_VERSION, MediaType};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::{
+    codecs::{self, DiscordRtpCodecMap},
+    dave::DaveIdentityKey,
     errors::{Error, InvalidInputError, Result},
     gateway::{GatewayReady, SpeakingUpdate, UdpDiscoveryPacket},
-    media::{FrameRaw, MediaCodec, RtpHeader, TransportCryptoConfig, duration_ms, duration_us},
+    media::{
+        FrameRaw, RtpFrameAssembler, RtpHeader, TransportCryptoConfig, duration_ms, duration_us,
+    },
     observer::{
         ConnectionEvent, ConnectionObserver, DavePendingMediaEvent, DavePendingMediaReason,
         ReceiveRtpPacketEvent, ReceiveRtpPacketLossEvent, WebSocketCloseFrame,
     },
-    opus::RtpFrameAssembler,
     queue::{BucketDeadlineQueue, DeadlineSet, QueueBucket},
+    secrets::RedactedSecret,
     stats::SlidingStats,
 };
 
@@ -50,7 +55,7 @@ impl Default for ConnectionTuning {
 }
 
 impl ConnectionTuning {
-    pub(crate) fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<ConnectionRuntimeTuning> {
         for (field, duration) in [
             ("dave_pending_media_ttl", self.dave_pending_media_ttl),
             ("rtp_reorder_ttl", self.rtp_reorder_ttl),
@@ -61,25 +66,20 @@ impl ConnectionTuning {
                 ));
             }
         }
-        for (field, value) in [
-            (
-                "receive_interarrival_window",
-                self.receive_interarrival_window,
-            ),
-            (
-                "rtp_reorder_buffer_max_frames",
-                self.rtp_reorder_buffer_max_frames,
-            ),
-            ("udp_receive_buffer_bytes", self.udp_receive_buffer_bytes),
-            ("ready_frame_buffer_max", self.ready_frame_buffer_max),
-            ("media_queue_capacity", self.media_queue_capacity),
-        ] {
-            if value == 0 {
-                return Err(Error::InvalidInput(
-                    InvalidInputError::ConnectionTuningZero { field },
-                ));
-            }
-        }
+        let receive_interarrival_window = nonzero_tuning(
+            self.receive_interarrival_window,
+            "receive_interarrival_window",
+        )?;
+        let rtp_reorder_buffer_max_frames = nonzero_tuning(
+            self.rtp_reorder_buffer_max_frames,
+            "rtp_reorder_buffer_max_frames",
+        )?;
+        let udp_receive_buffer_bytes =
+            nonzero_tuning(self.udp_receive_buffer_bytes, "udp_receive_buffer_bytes")?;
+        let ready_frame_buffer_max =
+            nonzero_tuning(self.ready_frame_buffer_max, "ready_frame_buffer_max")?;
+        let media_queue_capacity =
+            nonzero_tuning(self.media_queue_capacity, "media_queue_capacity")?;
         if self.udp_receive_buffer_bytes < u16::MAX as usize {
             return Err(Error::InvalidInput(
                 InvalidInputError::ConnectionTuningTooSmall {
@@ -89,8 +89,115 @@ impl ConnectionTuning {
                 },
             ));
         }
-        Ok(())
+        Ok(ConnectionRuntimeTuning {
+            dave_pending_media_ttl: self.dave_pending_media_ttl,
+            receive_interarrival_window,
+            rtp_reorder_ttl: self.rtp_reorder_ttl,
+            rtp_reorder_buffer_max_frames,
+            udp_receive_buffer_bytes,
+            ready_frame_buffer_max,
+            media_queue_capacity,
+        })
     }
+}
+
+fn nonzero_tuning(value: usize, field: &'static str) -> Result<NonZeroUsize> {
+    NonZeroUsize::new(value).ok_or(Error::InvalidInput(
+        InvalidInputError::ConnectionTuningZero { field },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionRuntimeTuning {
+    pub(crate) dave_pending_media_ttl: Duration,
+    pub(crate) receive_interarrival_window: NonZeroUsize,
+    pub(crate) rtp_reorder_ttl: Duration,
+    pub(crate) rtp_reorder_buffer_max_frames: NonZeroUsize,
+    pub(crate) udp_receive_buffer_bytes: NonZeroUsize,
+    pub(crate) ready_frame_buffer_max: NonZeroUsize,
+    pub(crate) media_queue_capacity: NonZeroUsize,
+}
+
+impl Default for ConnectionRuntimeTuning {
+    fn default() -> Self {
+        ConnectionTuning::default()
+            .validate()
+            .expect("default connection tuning is valid")
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VideoCodecPreferences {
+    codecs: Vec<Codec>,
+}
+
+impl VideoCodecPreferences {
+    pub fn all_libdave() -> Self {
+        Self::new(codecs::video_codecs().collect::<Vec<_>>())
+            .expect("libdave video codec list is valid")
+    }
+
+    pub fn new(video_codecs: impl Into<Vec<Codec>>) -> Result<Self> {
+        let codecs = video_codecs.into();
+        validate_video_codecs(&codecs)?;
+        Ok(Self { codecs })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.codecs.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[Codec] {
+        &self.codecs
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Codec> + '_ {
+        self.codecs.iter().copied()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionCodecPreferences {
+    pub video_codecs: VideoCodecPreferences,
+}
+
+impl ConnectionCodecPreferences {
+    pub fn all_libdave_video_codecs() -> Self {
+        Self {
+            video_codecs: VideoCodecPreferences::all_libdave(),
+        }
+    }
+
+    pub fn with_video_codecs(video_codecs: impl Into<Vec<Codec>>) -> Result<Self> {
+        Ok(Self {
+            video_codecs: VideoCodecPreferences::new(video_codecs)?,
+        })
+    }
+
+    pub fn video_enabled(&self) -> bool {
+        !self.video_codecs.is_empty()
+    }
+
+    pub(crate) fn video_codecs(&self) -> &[Codec] {
+        self.video_codecs.as_slice()
+    }
+}
+
+fn validate_video_codecs(video_codecs: &[Codec]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(video_codecs.len());
+    for &codec in video_codecs {
+        if codec.media_type() != MediaType::Video {
+            return Err(Error::InvalidInput(
+                InvalidInputError::VideoCodecPreferenceNotVideo { codec },
+            ));
+        }
+        if !seen.insert(codec) {
+            return Err(Error::InvalidInput(
+                InvalidInputError::DuplicateVideoCodecPreference { codec },
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -126,9 +233,11 @@ impl fmt::Debug for ConnectionConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionOptions {
     pub gateway_version: u8,
-    pub preferred_mode: Option<EncryptionMode>,
+    pub required_mode: Option<EncryptionMode>,
     pub max_dave_protocol_version: Option<u16>,
+    pub dave_identity: Option<DaveIdentityKey>,
     pub dave_send_media_ready_timeout: Duration,
+    pub codec_preferences: ConnectionCodecPreferences,
     pub tuning: ConnectionTuning,
 }
 
@@ -136,51 +245,18 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             gateway_version: 8,
-            preferred_mode: Some(EncryptionMode::aead_aes256_gcm_rtpsize()),
+            required_mode: Some(EncryptionMode::aead_aes256_gcm_rtpsize()),
             max_dave_protocol_version: Some(DAVE_PROTOCOL_VERSION.get()),
+            dave_identity: None,
             dave_send_media_ready_timeout: crate::DAVE_SEND_MEDIA_READY_TIMEOUT,
+            codec_preferences: ConnectionCodecPreferences::default(),
             tuning: ConnectionTuning::default(),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct SessionId(Zeroizing<String>);
-
-impl SessionId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(Zeroizing::new(value.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct Token(Zeroizing<String>);
-
-impl Token {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(Zeroizing::new(value.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
+pub(crate) type SessionId = RedactedSecret<String>;
+pub(crate) type Token = RedactedSecret<String>;
 
 impl ConnectionConfig {
     pub fn with_options(self, options: ConnectionOptions) -> ConnectionRequest {
@@ -203,19 +279,11 @@ pub struct ConnectionRequest {
 
 impl ConnectionRequest {
     pub fn validate(mut self) -> Result<ValidatedConnectionConfig> {
-        self.options.tuning.validate()?;
-        if self.options.gateway_version < 4 {
-            return Err(Error::InvalidInput(
-                InvalidInputError::UnsupportedGatewayVersion {
-                    version: self.options.gateway_version,
-                },
-            ));
-        }
-
+        let options = self.options.validate()?;
         let session_id = std::mem::take(&mut self.config.session_id);
         let token = std::mem::take(&mut self.config.token);
         let endpoint = std::mem::take(&mut self.config.endpoint);
-        let websocket_url = websocket_url(&endpoint, self.options.gateway_version);
+        let websocket_url = websocket_url(&endpoint, options.gateway_version);
         Ok(ValidatedConnectionConfig {
             identity: ConnectionIdentity {
                 guild_id: self.config.guild_id,
@@ -228,9 +296,41 @@ impl ConnectionRequest {
             },
             endpoint,
             websocket_url,
-            options: self.options,
+            options,
         })
     }
+}
+
+impl ConnectionOptions {
+    pub fn validate(self) -> Result<ValidatedConnectionOptions> {
+        if self.gateway_version < 4 {
+            return Err(Error::InvalidInput(
+                InvalidInputError::UnsupportedGatewayVersion {
+                    version: self.gateway_version,
+                },
+            ));
+        }
+        Ok(ValidatedConnectionOptions {
+            gateway_version: self.gateway_version,
+            required_mode: self.required_mode,
+            max_dave_protocol_version: self.max_dave_protocol_version,
+            dave_identity: self.dave_identity,
+            dave_send_media_ready_timeout: self.dave_send_media_ready_timeout,
+            codec_preferences: self.codec_preferences,
+            tuning: self.tuning.validate()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedConnectionOptions {
+    pub gateway_version: u8,
+    pub required_mode: Option<EncryptionMode>,
+    pub max_dave_protocol_version: Option<u16>,
+    pub dave_identity: Option<DaveIdentityKey>,
+    pub dave_send_media_ready_timeout: Duration,
+    pub codec_preferences: ConnectionCodecPreferences,
+    pub(crate) tuning: ConnectionRuntimeTuning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,7 +352,7 @@ pub struct ValidatedConnectionConfig {
     pub(crate) secrets: ConnectionSecrets,
     pub(crate) endpoint: String,
     pub(crate) websocket_url: String,
-    pub(crate) options: ConnectionOptions,
+    pub(crate) options: ValidatedConnectionOptions,
 }
 
 impl fmt::Debug for ValidatedConnectionConfig {
@@ -270,21 +370,25 @@ impl fmt::Debug for ValidatedConnectionConfig {
 
 impl ValidatedConnectionConfig {
     pub fn info(&self) -> ConnectionInfo {
-        self.runtime_config().public_info()
-    }
-
-    pub fn options(&self) -> &ConnectionOptions {
-        &self.options
-    }
-
-    pub(crate) fn runtime_config(&self) -> ConnectionRuntimeConfig {
-        ConnectionRuntimeConfig {
-            identity: self.identity,
+        ConnectionInfo {
+            guild_id: self.identity.guild_id,
+            channel_id: self.identity.channel_id,
+            user_id: self.identity.user_id,
             endpoint: self.endpoint.clone(),
             gateway_version: self.options.gateway_version,
             max_dave_protocol_version: self.options.max_dave_protocol_version,
-            dave_send_media_ready_timeout: self.options.dave_send_media_ready_timeout,
-            tuning: self.options.tuning,
+        }
+    }
+
+    pub fn options(&self) -> &ValidatedConnectionOptions {
+        &self.options
+    }
+
+    pub(crate) fn runtime_config(self) -> ConnectionRuntimeConfig {
+        ConnectionRuntimeConfig {
+            identity: self.identity,
+            endpoint: self.endpoint,
+            options: self.options,
         }
     }
 }
@@ -293,10 +397,7 @@ impl ValidatedConnectionConfig {
 pub(crate) struct ConnectionRuntimeConfig {
     pub(crate) identity: ConnectionIdentity,
     pub(crate) endpoint: String,
-    pub(crate) gateway_version: u8,
-    pub(crate) max_dave_protocol_version: Option<u16>,
-    pub(crate) dave_send_media_ready_timeout: Duration,
-    pub(crate) tuning: ConnectionTuning,
+    pub(crate) options: ValidatedConnectionOptions,
 }
 
 impl ConnectionRuntimeConfig {
@@ -306,8 +407,8 @@ impl ConnectionRuntimeConfig {
             channel_id: self.identity.channel_id,
             user_id: self.identity.user_id,
             endpoint: self.endpoint.clone(),
-            gateway_version: self.gateway_version,
-            max_dave_protocol_version: self.max_dave_protocol_version,
+            gateway_version: self.options.gateway_version,
+            max_dave_protocol_version: self.options.max_dave_protocol_version,
         }
     }
 }
@@ -338,11 +439,47 @@ impl WebSocketCloseFrame {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct EncryptionMode(String);
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EncryptionMode {
+    #[serde(rename = "aead_aes256_gcm_rtpsize")]
+    AeadAes256GcmRtpSize,
+    #[serde(rename = "aead_xchacha20_poly1305_rtpsize")]
+    AeadXChaCha20Poly1305RtpSize,
+}
 
 impl EncryptionMode {
+    pub const ALL: [Self; 2] = [
+        Self::AeadAes256GcmRtpSize,
+        Self::AeadXChaCha20Poly1305RtpSize,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AeadAes256GcmRtpSize => "aead_aes256_gcm_rtpsize",
+            Self::AeadXChaCha20Poly1305RtpSize => "aead_xchacha20_poly1305_rtpsize",
+        }
+    }
+
+    pub const fn aead_aes256_gcm_rtpsize() -> Self {
+        Self::AeadAes256GcmRtpSize
+    }
+
+    pub const fn aead_xchacha20_poly1305_rtpsize() -> Self {
+        Self::AeadXChaCha20Poly1305RtpSize
+    }
+}
+
+impl fmt::Display for EncryptionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct OfferedEncryptionMode(String);
+
+impl OfferedEncryptionMode {
     pub fn new(mode: impl Into<String>) -> Self {
         Self(mode.into())
     }
@@ -351,12 +488,20 @@ impl EncryptionMode {
         &self.0
     }
 
-    pub fn aead_aes256_gcm_rtpsize() -> Self {
-        Self::new("aead_aes256_gcm_rtpsize")
+    pub fn from_supported(mode: EncryptionMode) -> Self {
+        Self(mode.as_str().to_string())
     }
 
-    pub fn aead_xchacha20_poly1305_rtpsize() -> Self {
-        Self::new("aead_xchacha20_poly1305_rtpsize")
+    pub fn supported(&self) -> Option<EncryptionMode> {
+        EncryptionMode::ALL
+            .into_iter()
+            .find(|mode| self.0 == mode.as_str())
+    }
+}
+
+impl From<EncryptionMode> for OfferedEncryptionMode {
+    fn from(mode: EncryptionMode) -> Self {
+        Self::new(mode.as_str())
     }
 }
 
@@ -370,24 +515,30 @@ pub struct SessionDescription {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dave_protocol_version: Option<u16>,
 }
 
 impl SessionDescription {
-    pub(crate) fn new(
-        mode: EncryptionMode,
-        secret_key: SecretKey,
-        audio_codec: Option<String>,
-        dave_protocol_version: Option<u16>,
-    ) -> Result<Self> {
+    pub(crate) fn new(parts: SessionDescriptionParts) -> Result<Self> {
         Ok(Self {
-            transport_crypto: TransportCryptoConfig::new(&mode, secret_key.as_slice())?,
-            mode,
-            secret_key,
-            audio_codec,
-            dave_protocol_version,
+            transport_crypto: TransportCryptoConfig::new(parts.mode, parts.secret_key.as_slice())?,
+            mode: parts.mode,
+            secret_key: parts.secret_key,
+            audio_codec: parts.audio_codec,
+            video_codec: parts.video_codec,
+            dave_protocol_version: parts.dave_protocol_version,
         })
     }
+}
+
+pub(crate) struct SessionDescriptionParts {
+    pub(crate) mode: EncryptionMode,
+    pub(crate) secret_key: SecretKey,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) video_codec: Option<String>,
+    pub(crate) dave_protocol_version: Option<u16>,
 }
 
 impl<'de> Deserialize<'de> for SessionDescription {
@@ -401,16 +552,18 @@ impl<'de> Deserialize<'de> for SessionDescription {
             #[serde(default)]
             secret_key: SecretKey,
             audio_codec: Option<String>,
+            video_codec: Option<String>,
             dave_protocol_version: Option<u16>,
         }
 
         let wire = WireSessionDescription::deserialize(deserializer)?;
-        Self::new(
-            wire.mode,
-            wire.secret_key,
-            wire.audio_codec,
-            wire.dave_protocol_version,
-        )
+        Self::new(SessionDescriptionParts {
+            mode: wire.mode,
+            secret_key: wire.secret_key,
+            audio_codec: wire.audio_codec,
+            video_codec: wire.video_codec,
+            dave_protocol_version: wire.dave_protocol_version,
+        })
         .map_err(de::Error::custom)
     }
 }
@@ -421,38 +574,13 @@ impl fmt::Debug for SessionDescription {
             .field("mode", &self.mode)
             .field("secret_key", &self.secret_key)
             .field("audio_codec", &self.audio_codec)
+            .field("video_codec", &self.video_codec)
             .field("dave_protocol_version", &self.dave_protocol_version)
             .finish()
     }
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct SecretKey(Zeroizing<Vec<u8>>);
-
-impl SecretKey {
-    pub(crate) fn new(secret_key: Vec<u8>) -> Self {
-        Self(Zeroizing::new(secret_key))
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for SecretKey {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Vec::<u8>::deserialize(deserializer).map(Self::new)
-    }
-}
-
-impl fmt::Debug for SecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
+pub(crate) type SecretKey = RedactedSecret<Vec<u8>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionInfo {
@@ -478,14 +606,16 @@ impl ConnectionInfo {
 pub struct SessionState {
     pub mode: EncryptionMode,
     pub audio_codec: Option<String>,
+    pub video_codec: Option<String>,
     pub dave_protocol_version: Option<u16>,
 }
 
 impl From<&SessionDescription> for SessionState {
     fn from(description: &SessionDescription) -> Self {
         Self {
-            mode: description.mode.clone(),
+            mode: description.mode,
             audio_codec: description.audio_codec.clone(),
+            video_codec: description.video_codec.clone(),
             dave_protocol_version: description.dave_protocol_version,
         }
     }
@@ -503,6 +633,181 @@ pub struct DaveState {
     pub mls: DaveMlsState,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) enum DaveProtocolState {
+    #[default]
+    Unknown,
+    Transport,
+    Dave(u16),
+}
+
+impl DaveProtocolState {
+    pub(crate) fn from_gateway(protocol_version: Option<u16>) -> Self {
+        protocol_version.map_or(Self::Unknown, Self::from_prepared)
+    }
+
+    pub(crate) fn from_prepared(protocol_version: u16) -> Self {
+        if protocol_version == 0 {
+            Self::Transport
+        } else {
+            Self::Dave(protocol_version)
+        }
+    }
+
+    pub(crate) fn gateway_version(self) -> Option<u16> {
+        match self {
+            Self::Unknown => None,
+            Self::Transport => Some(0),
+            Self::Dave(protocol_version) => Some(protocol_version),
+        }
+    }
+
+    pub(crate) const fn is_dave(self) -> bool {
+        matches!(self, Self::Dave(_))
+    }
+
+    pub(crate) const fn is_transport_or_unknown(self) -> bool {
+        !self.is_dave()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaveActiveMediaState {
+    send: DaveProtocolState,
+    receive: DaveProtocolState,
+}
+
+impl DaveActiveMediaState {
+    pub(crate) fn set_both(&mut self, protocol: DaveProtocolState) {
+        self.send = protocol;
+        self.receive = protocol;
+    }
+
+    pub(crate) fn send_protocol(self) -> Option<u16> {
+        self.send.gateway_version()
+    }
+
+    pub(crate) fn receive_protocol(self) -> Option<u16> {
+        self.receive.gateway_version()
+    }
+
+    pub(crate) const fn send_active(self) -> bool {
+        self.send.is_dave()
+    }
+
+    pub(crate) const fn receive_active(self) -> bool {
+        self.receive.is_dave()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub(crate) enum DaveGatewayPhase {
+    #[default]
+    Unknown,
+    Session {
+        protocol: DaveProtocolState,
+    },
+    PreparedTransition {
+        transition_id: u16,
+        protocol: DaveProtocolState,
+    },
+    PreparedEpoch {
+        protocol: DaveProtocolState,
+        epoch: u64,
+        seq: u64,
+        transition_id: Option<u16>,
+    },
+}
+
+impl DaveGatewayPhase {
+    pub(crate) fn protocol(self) -> DaveProtocolState {
+        match self {
+            Self::Unknown => DaveProtocolState::Unknown,
+            Self::Session { protocol }
+            | Self::PreparedTransition { protocol, .. }
+            | Self::PreparedEpoch { protocol, .. } => protocol,
+        }
+    }
+
+    pub(crate) fn protocol_version(self) -> Option<u16> {
+        self.protocol().gateway_version()
+    }
+
+    pub(crate) fn transition_id(self) -> Option<u16> {
+        match self {
+            Self::PreparedTransition { transition_id, .. } => Some(transition_id),
+            Self::PreparedEpoch { transition_id, .. } => transition_id,
+            Self::Unknown | Self::Session { .. } => None,
+        }
+    }
+
+    pub(crate) fn epoch(self) -> Option<u64> {
+        match self {
+            Self::PreparedEpoch { epoch, .. } => Some(epoch),
+            Self::Unknown | Self::Session { .. } | Self::PreparedTransition { .. } => None,
+        }
+    }
+
+    pub(crate) fn prepare_epoch_seq(self) -> u64 {
+        match self {
+            Self::PreparedEpoch { seq, .. } => seq,
+            Self::Unknown | Self::Session { .. } | Self::PreparedTransition { .. } => 0,
+        }
+    }
+
+    pub(crate) fn passthrough(self) -> bool {
+        match self {
+            Self::Unknown => false,
+            Self::Session { protocol }
+            | Self::PreparedTransition { protocol, .. }
+            | Self::PreparedEpoch { protocol, .. } => protocol.is_transport_or_unknown(),
+        }
+    }
+
+    fn with_transition_id(self, transition_id: u16) -> Self {
+        match self {
+            Self::PreparedEpoch {
+                protocol,
+                epoch,
+                seq,
+                ..
+            } => Self::PreparedEpoch {
+                protocol,
+                epoch,
+                seq,
+                transition_id: Some(transition_id),
+            },
+            Self::Unknown | Self::Session { .. } | Self::PreparedTransition { .. } => {
+                Self::PreparedTransition {
+                    transition_id,
+                    protocol: self.protocol(),
+                }
+            }
+        }
+    }
+
+    fn without_transition(self, transition_id: u16) -> Self {
+        if self.transition_id() != Some(transition_id) {
+            return self;
+        }
+        match self {
+            Self::PreparedEpoch {
+                protocol,
+                epoch,
+                seq,
+                ..
+            } => Self::PreparedEpoch {
+                protocol,
+                epoch,
+                seq,
+                transition_id: None,
+            },
+            Self::PreparedTransition { protocol, .. } => Self::Session { protocol },
+            Self::Unknown | Self::Session { .. } => self,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DaveMlsState {
     pub external_sender: bool,
@@ -516,24 +821,110 @@ pub struct DavePendingMlsState {
     pub welcome: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub(crate) enum DaveMlsMessageKind {
+    Commit,
+    Welcome,
+}
+
+impl DaveMlsMessageKind {
+    pub(crate) const fn operation_label(self) -> &'static str {
+        match self {
+            Self::Commit => "commit processing",
+            Self::Welcome => "welcome processing",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub(crate) struct DaveMlsMessageIdentity {
+    pub(crate) kind: DaveMlsMessageKind,
+    pub(crate) seq: i64,
+    pub(crate) transition_id: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct PendingDaveMlsMessage {
+    pub(crate) identity: DaveMlsMessageIdentity,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl PendingDaveMlsMessage {
+    pub(crate) fn new(identity: DaveMlsMessageIdentity, payload: Vec<u8>) -> Self {
+        Self { identity, payload }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct DaveMlsSlots<T> {
+    commit: Option<T>,
+    welcome: Option<T>,
+}
+
+impl<T> Default for DaveMlsSlots<T> {
+    fn default() -> Self {
+        Self {
+            commit: None,
+            welcome: None,
+        }
+    }
+}
+
+impl<T> DaveMlsSlots<T> {
+    pub(crate) const fn commit(&self) -> Option<&T> {
+        self.commit.as_ref()
+    }
+
+    pub(crate) const fn welcome(&self) -> Option<&T> {
+        self.welcome.as_ref()
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.commit.is_none() && self.welcome.is_none()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.commit = None;
+        self.welcome = None;
+    }
+
+    pub(crate) fn get(&self, kind: DaveMlsMessageKind) -> Option<&T> {
+        match kind {
+            DaveMlsMessageKind::Commit => self.commit(),
+            DaveMlsMessageKind::Welcome => self.welcome(),
+        }
+    }
+
+    pub(crate) fn set(&mut self, kind: DaveMlsMessageKind, value: T) {
+        match kind {
+            DaveMlsMessageKind::Commit => self.commit = Some(value),
+            DaveMlsMessageKind::Welcome => self.welcome = Some(value),
+        }
+    }
+
+    pub(crate) fn welcome_then_commit(&self) -> impl Iterator<Item = &T> {
+        [self.welcome(), self.commit()].into_iter().flatten()
+    }
+}
+
+impl DaveMlsSlots<PendingDaveMlsMessage> {
+    pub(crate) fn set_message(&mut self, message: PendingDaveMlsMessage) {
+        self.set(message.identity.kind, message);
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub(crate) struct DaveInternalState {
-    pub(crate) protocol_version: Option<u16>,
-    pub(crate) active_send_protocol_version: Option<u16>,
-    pub(crate) active_receive_protocol_version: Option<u16>,
-    pub(crate) transition_id: Option<u16>,
-    pub(crate) epoch: Option<u64>,
     #[serde(default)]
-    pub(crate) prepare_epoch_seq: u64,
-    pub(crate) passthrough: bool,
+    pub(crate) phase: DaveGatewayPhase,
+    #[serde(default)]
+    pub(crate) active: DaveActiveMediaState,
     #[serde(default)]
     pub(crate) external_sender: Option<Vec<u8>>,
     #[serde(default)]
     pub(crate) proposals: Vec<Vec<u8>>,
     #[serde(default)]
-    pub(crate) pending_commit: Option<Vec<u8>>,
-    #[serde(default)]
-    pub(crate) pending_welcome: Option<Vec<u8>>,
+    pub(crate) pending_mls: DaveMlsSlots<PendingDaveMlsMessage>,
 }
 
 impl DaveInternalState {
@@ -542,72 +933,122 @@ impl DaveInternalState {
             external_sender: self.external_sender.is_some(),
             pending: DavePendingMlsState {
                 proposals: self.proposals.len(),
-                commit: self.pending_commit.is_some(),
-                welcome: self.pending_welcome.is_some(),
+                commit: self.pending_mls.commit().is_some(),
+                welcome: self.pending_mls.welcome().is_some(),
             },
         }
     }
 
     pub(crate) fn public_state(&self) -> DaveState {
         DaveState {
-            protocol_version: self.protocol_version,
-            active_send_protocol_version: self.active_send_protocol_version,
-            active_receive_protocol_version: self.active_receive_protocol_version,
-            transition_id: self.transition_id,
-            epoch: self.epoch,
-            prepare_epoch_seq: self.prepare_epoch_seq,
-            passthrough: self.passthrough,
+            protocol_version: self.protocol_version(),
+            active_send_protocol_version: self.active_send_protocol_version(),
+            active_receive_protocol_version: self.active_receive_protocol_version(),
+            transition_id: self.transition_id(),
+            epoch: self.epoch(),
+            prepare_epoch_seq: self.prepare_epoch_seq(),
+            passthrough: self.passthrough(),
             mls: self.mls_state(),
         }
     }
 
+    pub(crate) fn protocol_version(&self) -> Option<u16> {
+        self.phase.protocol_version()
+    }
+
+    pub(crate) fn active_send_protocol_version(&self) -> Option<u16> {
+        self.active.send_protocol()
+    }
+
+    pub(crate) fn active_receive_protocol_version(&self) -> Option<u16> {
+        self.active.receive_protocol()
+    }
+
+    pub(crate) fn transition_id(&self) -> Option<u16> {
+        self.phase.transition_id()
+    }
+
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.phase.epoch()
+    }
+
+    pub(crate) fn prepare_epoch_seq(&self) -> u64 {
+        self.phase.prepare_epoch_seq()
+    }
+
+    pub(crate) fn passthrough(&self) -> bool {
+        self.phase.passthrough()
+    }
+
     pub(crate) fn set_session_protocol(&mut self, protocol_version: Option<u16>) {
-        if self.protocol_version != protocol_version {
+        let protocol = DaveProtocolState::from_gateway(protocol_version);
+        if self.phase.protocol() != protocol {
             self.clear_pending_mls();
         }
-        self.protocol_version = protocol_version;
-        self.passthrough = protocol_version.unwrap_or(0) == 0;
-        if self.passthrough {
-            self.active_send_protocol_version = protocol_version;
-            self.active_receive_protocol_version = protocol_version;
+        self.phase = DaveGatewayPhase::Session { protocol };
+        if protocol.is_transport_or_unknown() {
+            self.active.set_both(protocol);
         }
     }
 
     pub(crate) fn prepare_transition(&mut self, transition_id: u16, protocol_version: u16) {
-        if self.transition_id != Some(transition_id) {
+        if self.transition_id() != Some(transition_id) {
             self.clear_pending_mls();
         }
-        self.transition_id = Some(transition_id);
-        self.protocol_version = Some(protocol_version);
-        self.passthrough = protocol_version == 0;
-        if self.epoch == Some(1) && transition_id == 0 && protocol_version > 0 {
+        let protocol = DaveProtocolState::from_prepared(protocol_version);
+        self.phase = match self.phase {
+            DaveGatewayPhase::PreparedEpoch { epoch, seq, .. } => DaveGatewayPhase::PreparedEpoch {
+                protocol,
+                epoch,
+                seq,
+                transition_id: Some(transition_id),
+            },
+            DaveGatewayPhase::Unknown
+            | DaveGatewayPhase::Session { .. }
+            | DaveGatewayPhase::PreparedTransition { .. } => DaveGatewayPhase::PreparedTransition {
+                transition_id,
+                protocol,
+            },
+        };
+        if self.epoch() == Some(1) && transition_id == 0 && protocol.is_dave() {
             self.execute_transition(transition_id);
         }
     }
 
     pub(crate) fn prepare_epoch(&mut self, protocol_version: u16, epoch: u64) {
-        self.prepare_epoch_seq = self.prepare_epoch_seq.saturating_add(1);
-        if epoch == 1 || self.epoch != Some(epoch) {
+        let seq = self.prepare_epoch_seq().saturating_add(1);
+        if epoch == 1 || self.epoch() != Some(epoch) {
             self.clear_pending_mls();
         }
-        self.epoch = Some(epoch);
-        self.protocol_version = Some(protocol_version);
-        self.passthrough = protocol_version == 0;
+        self.phase = DaveGatewayPhase::PreparedEpoch {
+            protocol: DaveProtocolState::from_prepared(protocol_version),
+            epoch,
+            seq,
+            transition_id: self.transition_id(),
+        };
     }
 
     pub(crate) fn execute_transition(&mut self, transition_id: u16) {
-        if self.transition_id == Some(transition_id) {
-            self.active_send_protocol_version = self.protocol_version;
-            self.active_receive_protocol_version = self.protocol_version;
-            self.transition_id = None;
+        if self.transition_id() == Some(transition_id) {
+            self.active.set_both(self.phase.protocol());
+            self.phase = self.phase.without_transition(transition_id);
         }
         self.clear_pending_mls();
     }
 
+    pub(crate) fn set_pending_mls_message(&mut self, message: PendingDaveMlsMessage) {
+        if self.transition_id() != Some(message.identity.transition_id) {
+            self.clear_pending_mls();
+        }
+        self.phase = self
+            .phase
+            .with_transition_id(message.identity.transition_id);
+        self.pending_mls.set_message(message);
+    }
+
     pub(crate) fn clear_pending_mls(&mut self) {
         self.proposals.clear();
-        self.pending_commit = None;
-        self.pending_welcome = None;
+        self.pending_mls.clear();
     }
 }
 
@@ -636,6 +1077,7 @@ pub(crate) struct ConnectionInternalState {
     pub(crate) discovery: UdpDiscoveryPacket,
     pub(crate) selected_mode: EncryptionMode,
     pub(crate) session_description: Option<SessionDescription>,
+    pub(crate) rtp_codecs: Option<DiscordRtpCodecMap>,
     pub(crate) connected_user_ids: Arc<HashSet<u64>>,
     pub(crate) ssrc_users: Arc<HashMap<u32, u64>>,
     pub(crate) speaking: Arc<HashMap<u32, SpeakingUpdate>>,
@@ -662,7 +1104,7 @@ impl ConnectionInternalState {
             connection: self.config.public_info(),
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             local_ssrc: self.ready.ssrc,
-            selected_mode: self.selected_mode.clone(),
+            selected_mode: self.selected_mode,
             session: self.session_description.as_ref().map(SessionState::from),
             connected_user_ids: self.connected_user_ids.clone(),
             ssrc_users: self.ssrc_users.clone(),
@@ -677,7 +1119,7 @@ pub(crate) struct ReceiveState<Raw>
 where
     Raw: FrameRaw,
 {
-    tuning: ConnectionTuning,
+    tuning: ConnectionRuntimeTuning,
     pub(crate) pending_dave_media: PendingDaveMediaQueues<Raw>,
     pub(crate) ssrc: HashMap<u32, ReceiveSsrcState<Raw>>,
     ready_ssrcs: VecDeque<u32>,
@@ -690,7 +1132,7 @@ where
     Raw: FrameRaw,
 {
     fn default() -> Self {
-        Self::new(ConnectionTuning::default())
+        Self::new(ConnectionRuntimeTuning::default())
     }
 }
 
@@ -698,7 +1140,7 @@ impl<Raw> ReceiveState<Raw>
 where
     Raw: FrameRaw,
 {
-    pub(crate) fn new(tuning: ConnectionTuning) -> Self {
+    pub(crate) fn new(tuning: ConnectionRuntimeTuning) -> Self {
         Self {
             tuning,
             pending_dave_media: PendingDaveMediaQueues::new(tuning.dave_pending_media_ttl),
@@ -736,7 +1178,7 @@ where
         &mut self,
         observer: &O,
         packet: PendingMediaPacket<Raw>,
-    ) -> Option<PendingMediaFrame<Raw>>
+    ) -> Result<Option<PendingMediaFrame<Raw>>>
     where
         O: ConnectionObserver,
     {
@@ -751,7 +1193,10 @@ where
         frame
     }
 
-    pub(crate) fn drain_ordered_media<O>(&mut self, observer: &O) -> Option<PendingMediaFrame<Raw>>
+    pub(crate) fn drain_ordered_media<O>(
+        &mut self,
+        observer: &O,
+    ) -> Option<Result<PendingMediaFrame<Raw>>>
     where
         O: ConnectionObserver,
     {
@@ -761,9 +1206,16 @@ where
                 let Some(state) = self.ssrc.get_mut(&ssrc) else {
                     continue;
                 };
-                if let Some(frame) = state.pop_ready_buffered_frame() {
-                    self.refresh_ssrc_schedules(ssrc);
-                    return Some(frame);
+                match state.pop_ready_buffered_frame() {
+                    Ok(Some(frame)) => {
+                        self.refresh_ssrc_schedules(ssrc);
+                        return Some(Ok(frame));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.refresh_ssrc_schedules(ssrc);
+                        return Some(Err(error));
+                    }
                 }
                 self.refresh_ssrc_schedules(ssrc);
                 continue;
@@ -925,7 +1377,7 @@ where
     Raw: FrameRaw,
 {
     fn default() -> Self {
-        Self::new(ConnectionTuning::default().dave_pending_media_ttl)
+        Self::new(ConnectionRuntimeTuning::default().dave_pending_media_ttl)
     }
 }
 
@@ -984,7 +1436,7 @@ pub(crate) struct ReceiveSsrcState<Raw>
 where
     Raw: FrameRaw,
 {
-    tuning: ConnectionTuning,
+    tuning: ConnectionRuntimeTuning,
     pub(crate) last_arrival: Option<Instant>,
     pub(crate) next_seq: Option<u16>,
     pub(crate) missing: BTreeMap<u16, MissingRtpPacket>,
@@ -998,7 +1450,7 @@ where
     Raw: FrameRaw,
 {
     fn default() -> Self {
-        Self::new(ConnectionTuning::default())
+        Self::new(ConnectionRuntimeTuning::default())
     }
 }
 
@@ -1006,14 +1458,14 @@ impl<Raw> ReceiveSsrcState<Raw>
 where
     Raw: FrameRaw,
 {
-    pub(crate) fn new(tuning: ConnectionTuning) -> Self {
+    pub(crate) fn new(tuning: ConnectionRuntimeTuning) -> Self {
         Self {
             tuning,
             last_arrival: None,
             next_seq: None,
             missing: BTreeMap::new(),
             pending_media: BTreeMap::new(),
-            interarrival: SlidingStats::new(tuning.receive_interarrival_window),
+            interarrival: SlidingStats::new(tuning.receive_interarrival_window.get()),
             assembler: RtpFrameAssembler::default(),
         }
     }
@@ -1023,7 +1475,7 @@ where
         observer: &O,
         packet: PendingMediaPacket<Raw>,
         now: Instant,
-    ) -> Option<PendingMediaFrame<Raw>>
+    ) -> Result<Option<PendingMediaFrame<Raw>>>
     where
         O: ConnectionObserver,
     {
@@ -1043,7 +1495,7 @@ where
 
         let forward = seq.wrapping_sub(expected);
         if forward < 0x8000 {
-            if usize::from(forward) > self.tuning.rtp_reorder_buffer_max_frames {
+            if usize::from(forward) > self.tuning.rtp_reorder_buffer_max_frames.get() {
                 self.emit_packet_loss(
                     observer,
                     ReceiveRtpPacketLossEvent {
@@ -1057,19 +1509,20 @@ where
                 );
                 self.missing.clear();
                 self.pending_media.clear();
+                self.assembler.clear();
                 self.next_seq = Some(seq.wrapping_add(1));
                 return self.assembler.push_packet(packet);
             }
 
             self.mark_missing(expected, forward, packet.user_id, now);
             self.pending_media.entry(seq).or_insert(packet);
-            if self.pending_media.len() > self.tuning.rtp_reorder_buffer_max_frames {
+            if self.pending_media.len() > self.tuning.rtp_reorder_buffer_max_frames.get() {
                 self.expire_missing_head(observer, ssrc, now, true);
             }
             return self.pop_ready_buffered_frame();
         }
 
-        None
+        Ok(None)
     }
 
     fn record_arrival<O>(&mut self, observer: &O, packet: &PendingMediaPacket<Raw>, now: Instant)
@@ -1115,13 +1568,22 @@ where
     }
 
     fn has_ready_buffered_media(&self) -> bool {
-        self.next_seq
-            .is_some_and(|seq| self.pending_media.contains_key(&seq))
+        self.assembler.has_completed_frame()
+            || self
+                .next_seq
+                .is_some_and(|seq| self.pending_media.contains_key(&seq))
     }
 
-    fn pop_ready_buffered_frame(&mut self) -> Option<PendingMediaFrame<Raw>> {
-        let seq = self.next_seq?;
-        let packet = self.pending_media.remove(&seq)?;
+    fn pop_ready_buffered_frame(&mut self) -> Result<Option<PendingMediaFrame<Raw>>> {
+        if let Some(frame) = self.assembler.pop_completed() {
+            return Ok(Some(frame));
+        }
+        let Some(seq) = self.next_seq else {
+            return Ok(None);
+        };
+        let Some(packet) = self.pending_media.remove(&seq) else {
+            return Ok(None);
+        };
         self.missing.remove(&seq);
         self.next_seq = Some(seq.wrapping_add(1));
         self.assembler.push_packet(packet)
@@ -1166,6 +1628,7 @@ where
         if missing_packets == 0 {
             return false;
         }
+        self.assembler.clear();
         self.next_seq = Some(seq);
         self.emit_packet_loss(
             observer,
@@ -1214,7 +1677,7 @@ where
     pub(crate) raw: Raw::Packet,
     pub(crate) rtp: RtpHeader,
     pub(crate) user_id: Option<u64>,
-    pub(crate) codec: MediaCodec,
+    pub(crate) codec: Codec,
     pub(crate) encrypted_payload: Vec<u8>,
     pub(crate) dave: bool,
 }
@@ -1226,7 +1689,7 @@ where
     pub(crate) raw: Raw,
     pub(crate) rtp: RtpHeader,
     pub(crate) user_id: Option<u64>,
-    pub(crate) codec: MediaCodec,
+    pub(crate) codec: Codec,
     pub(crate) encrypted_frame: Vec<u8>,
     pub(crate) dave: bool,
     pub(crate) enqueued_at: Instant,
